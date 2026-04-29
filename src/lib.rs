@@ -124,6 +124,46 @@ impl BloomFilter {
 
         true
     }
+
+    pub fn with_false_positive_rate(expected_items: usize, false_positive_rate: f64) -> Self {
+        let num_bits = optimal_num_bits(expected_items, false_positive_rate);
+
+        let num_hashes = optimal_num_hashes(num_bits, expected_items);
+
+        Self::with_num_bits(num_bits, num_hashes)
+    }
+}
+
+pub fn optimal_num_bits(expected_items: usize, false_positive_rate: f64) -> usize {
+    assert!(expected_items > 0, "expected_items must be greater than 0");
+
+    assert!(
+        false_positive_rate > 0.0 && false_positive_rate < 1.0,
+        "false_positive_rate must be between 0 and 1"
+    );
+
+    let n = expected_items as f64;
+    let p = false_positive_rate;
+
+    let ln_2 = std::f64::consts::LN_2;
+
+    let raw_bits = -(n * p.ln()) / (ln_2 * ln_2);
+    let bits = raw_bits.ceil() as usize;
+
+    bits.div_ceil(64) * 64
+}
+
+pub fn optimal_num_hashes(num_bits: usize, expected_items: usize) -> u32 {
+    assert!(num_bits > 0, "num_bits must be greater than 0");
+    assert!(expected_items > 0, "expected_items must be greater than 0");
+
+    let m = num_bits as f64;
+    let n = expected_items as f64;
+
+    let raw_hashes = (m / n) * std::f64::consts::LN_2;
+    let hashes = raw_hashes.round() as u32;
+
+    hashes.max(1)
 }
 
 fn hash_with_seed<T: Hash + ?Sized>(value: &T, seed: u64) -> u64 {
@@ -135,6 +175,7 @@ fn hash_with_seed<T: Hash + ?Sized>(value: &T, seed: u64) -> u64 {
 
     hasher.finish()
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,10 +255,8 @@ mod tests {
     fn insert_reports_whether_all_bits_were_already_set() {
         let mut filter = BloomFilter::with_num_bits(1024, 3);
 
-        // First insert should set at least one new bit.
         assert!(!filter.insert("hello"));
 
-        // Second insert of the same value should find all its bits already set.
         assert!(filter.insert("hello"));
     }
 }
