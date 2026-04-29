@@ -1,3 +1,5 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 // here, we store packs of 64 bits in form of Vec<u64>
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct BitVec64 {
@@ -71,6 +73,68 @@ impl BitVec64 {
     }
 }
 
+pub struct BloomFilter {
+    bits: BitVec64,
+    num_hashes: u32,
+}
+
+impl BloomFilter {
+    pub fn with_num_bits(num_bits: usize, num_hashes: u32) -> Self {
+        assert!(num_hashes > 0, "bloom filter should atleast use one hash");
+
+        Self {
+            bits: BitVec64::new(num_bits),
+            num_hashes,
+        }
+    }
+
+    pub fn num_bits(&self) -> usize {
+        self.bits.num_bits()
+    }
+
+    pub fn num_hashes(&self) -> u32 {
+        self.num_hashes
+    }
+
+    pub fn insert<T: Hash + ?Sized>(&mut self, value: &T) -> bool {
+        let mut previously_contained = true;
+
+        for seed in 0..self.num_hashes {
+            let hash = hash_with_seed(value, seed as u64);
+
+            let index = (hash as usize) % self.num_bits();
+
+            let was_set = self.bits.set_bit_to_1(index);
+
+            previously_contained &= was_set;
+        }
+
+        previously_contained
+    }
+
+    pub fn contains<T: Hash + ?Sized>(&self, value: &T) -> bool {
+        for seed in 0..self.num_hashes {
+            let hash = hash_with_seed(value, seed as u64);
+            let index = (hash as usize) % self.num_bits();
+
+            if !self.bits.check(index) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+fn hash_with_seed<T: Hash + ?Sized>(value: &T, seed: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+
+    seed.hash(&mut hasher);
+
+    value.hash(&mut hasher);
+
+    hasher.finish()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +177,47 @@ mod tests {
         assert!(bits.check(64));
         assert!(!bits.check(62));
         assert!(!bits.check(65));
+    }
+
+    #[test]
+    fn empty_bloom_filter_contains_nothing() {
+        let filter = BloomFilter::with_num_bits(1024, 3);
+
+        assert!(!filter.contains("hello"));
+        assert!(!filter.contains("rust"));
+        assert!(!filter.contains(&12345));
+    }
+
+    #[test]
+    fn inserted_value_is_contained() {
+        let mut filter = BloomFilter::with_num_bits(1024, 3);
+
+        filter.insert("hello");
+
+        assert!(filter.contains("hello"));
+    }
+
+    #[test]
+    fn many_inserted_values_are_contained() {
+        let mut filter = BloomFilter::with_num_bits(10_000, 4);
+
+        for value in 0..1000 {
+            filter.insert(&value);
+        }
+
+        for value in 0..1000 {
+            assert!(filter.contains(&value));
+        }
+    }
+
+    #[test]
+    fn insert_reports_whether_all_bits_were_already_set() {
+        let mut filter = BloomFilter::with_num_bits(1024, 3);
+
+        // First insert should set at least one new bit.
+        assert!(!filter.insert("hello"));
+
+        // Second insert of the same value should find all its bits already set.
+        assert!(filter.insert("hello"));
     }
 }
