@@ -98,14 +98,13 @@ impl BloomFilter {
 
     pub fn insert<T: Hash + ?Sized>(&mut self, value: &T) -> bool {
         let mut previously_contained = true;
+        let (h1, h2) = base_hashes(value);
 
-        for seed in 0..self.num_hashes {
-            let hash = hash_with_seed(value, seed as u64);
-
+        for i in 0..self.num_hashes {
+            let hash = nth_hash(h1, h2, i as u64);
             let index = (hash as usize) % self.num_bits();
 
             let was_set = self.bits.set_bit_to_1(index);
-
             previously_contained &= was_set;
         }
 
@@ -113,8 +112,10 @@ impl BloomFilter {
     }
 
     pub fn contains<T: Hash + ?Sized>(&self, value: &T) -> bool {
-        for seed in 0..self.num_hashes {
-            let hash = hash_with_seed(value, seed as u64);
+        let (h1, h2) = base_hashes(value);
+
+        for i in 0..self.num_hashes {
+            let hash = nth_hash(h1, h2, i as u64);
             let index = (hash as usize) % self.num_bits();
 
             if !self.bits.check(index) {
@@ -166,11 +167,21 @@ pub fn optimal_num_hashes(num_bits: usize, expected_items: usize) -> u32 {
     hashes.max(1)
 }
 
+fn base_hashes<T: Hash + ?Sized>(value: &T) -> (u64, u64) {
+    let h1 = hash_with_seed(value, 0);
+    let h2 = hash_with_seed(value, 1);
+
+    (h1, h2)
+}
+
+fn nth_hash(h1: u64, h2: u64, i: u64) -> u64 {
+    h1.wrapping_add(i.wrapping_mul(h2))
+}
+
 fn hash_with_seed<T: Hash + ?Sized>(value: &T, seed: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
 
     seed.hash(&mut hasher);
-
     value.hash(&mut hasher);
 
     hasher.finish()
