@@ -98,13 +98,25 @@ impl BloomFilter {
 
     pub fn insert<T: Hash + ?Sized>(&mut self, value: &T) -> bool {
         let mut previously_contained = true;
-        let (h1, h2) = base_hashes(value);
+        let h1 = hash_with_seed(value, 0);
 
-        for i in 0..self.num_hashes {
+        let first_index = index(self.num_bits(), h1);
+        let first_was_set = self.bits.set_bit_to_1(first_index);
+
+        previously_contained &= first_was_set;
+
+        if self.num_hashes == 1 {
+            return previously_contained;
+        }
+
+        let h2 = hash_with_seed(value, 1);
+
+        for i in 1..self.num_hashes {
             let hash = nth_hash(h1, h2, i as u64);
-            let index = (hash as usize) % self.num_bits();
 
-            let was_set = self.bits.set_bit_to_1(index);
+            let bit_index = index(self.num_bits(), hash);
+            let was_set = self.bits.set_bit_to_1(bit_index);
+
             previously_contained &= was_set;
         }
 
@@ -112,13 +124,24 @@ impl BloomFilter {
     }
 
     pub fn contains<T: Hash + ?Sized>(&self, value: &T) -> bool {
-        let (h1, h2) = base_hashes(value);
+        let h1 = hash_with_seed(value, 0);
+        let first_index = index(self.num_bits(), h1);
 
-        for i in 0..self.num_hashes {
+        if !self.bits.check(first_index) {
+            return false;
+        }
+
+        if self.num_hashes == 1 {
+            return true;
+        }
+
+        let h2 = hash_with_seed(value, 1);
+
+        for i in 1..self.num_hashes {
             let hash = nth_hash(h1, h2, i as u64);
-            let index = (hash as usize) % self.num_bits();
+            let bit_index = index(self.num_bits(), hash);
 
-            if !self.bits.check(index) {
+            if !self.bits.check(bit_index) {
                 return false;
             }
         }
@@ -132,6 +155,14 @@ impl BloomFilter {
         let num_hashes = optimal_num_hashes(num_bits, expected_items);
 
         Self::with_num_bits(num_bits, num_hashes)
+    }
+
+    pub fn expected_density(&self, inserted_items: usize) -> f64 {
+        expected_density(self.num_bits(), self.num_hashes(), inserted_items)
+    }
+
+    pub fn expected_false_positive_rate(&self, inserted_items: usize) -> f64 {
+        expected_false_positive_rate(self.num_bits(), self.num_hashes(), inserted_items)
     }
 }
 
@@ -185,6 +216,33 @@ fn hash_with_seed<T: Hash + ?Sized>(value: &T, seed: u64) -> u64 {
     value.hash(&mut hasher);
 
     hasher.finish()
+}
+
+fn index(num_bits: usize, hash: u64) -> usize {
+    assert!(num_bits > 0, "num_bits must be greater than 0");
+    let product = hash as u128 * num_bits as u128;
+    (product >> 64) as usize
+}
+
+pub fn expected_density(num_bits: usize, num_hashes: u32, inserted_items: usize) -> f64 {
+    assert!(num_bits > 0, "num_bits must be greater than 0");
+    assert!(num_hashes > 0, "num_hashes must be greater than 0");
+
+    let m = num_bits as f64;
+    let k = num_hashes as f64;
+    let n = inserted_items as f64;
+
+    1.0 - (-(k * n) / m).exp()
+}
+
+pub fn expected_false_positive_rate(
+    num_bits: usize,
+    num_hashes: u32,
+    inserted_items: usize,
+) -> f64 {
+    let density = expected_density(num_bits, num_hashes, inserted_items);
+
+    density.powi(num_hashes as i32)
 }
 
 #[cfg(test)]
