@@ -1,4 +1,7 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 // here, we store packs of 64 bits in form of Vec<u64>
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -8,6 +11,141 @@ pub struct BitVec64 {
     // number of bits we will need
     // this can be smaller than words.len() * 64
     num_bits: usize,
+}
+
+#[derive(Debug)]
+pub struct AtomicBitVec64 {
+    words: Vec<AtomicU64>,
+    num_bits: usize,
+}
+
+impl AtomicBitVec64 {
+    pub fn new(num_bits: usize) -> Self {
+        assert!(num_bits > 0, "bit vector must have at least one bit");
+
+        let num_words = num_bits.div_ceil(64);
+
+        let words = (0..num_words).map(|_| AtomicU64::new(0)).collect();
+
+        Self { words, num_bits }
+    }
+
+    pub fn num_bits(&self) -> usize {
+        self.num_bits
+    }
+
+    pub fn set(&self, index: usize) -> bool {
+        assert!(index < self.num_bits, "bit index out of bounds");
+
+        let word_index = index >> 6;
+        let bit_offset = index & 63;
+        let mask = 1u64 << bit_offset;
+        let old_word = self.words[word_index].fetch_or(mask, Ordering::Relaxed);
+
+        old_word & mask != 0
+    }
+
+    pub fn check(&self, index: usize) -> bool {
+        assert!(index < self.num_bits, "bit index out of bounds");
+
+        let word_index = index >> 6;
+        let bit_offset = index & 63;
+        let mask = 1u64 << bit_offset;
+
+        let word = self.words[word_index].load(Ordering::Relaxed);
+
+        word & mask != 0
+    }
+}
+
+#[derive(Debug)]
+pub struct AtomicBloomFilter {
+    bits: AtomicBitVec64,
+    num_hashes: u32,
+}
+
+impl AtomicBloomFilter {
+    pub fn with_num_bits(num_bits: usize, num_hashes: u32) -> Self {
+        assert!(num_hashes > 0, "Bloom filter must use at least one hash");
+
+        Self {
+            bits: AtomicBitVec64::new(num_bits),
+            num_hashes,
+        }
+    }
+
+    pub fn with_false_positive_rate(expected_items: usize, false_positive_rate: f64) -> Self {
+        let num_bits = optimal_num_bits(expected_items, false_positive_rate);
+        let num_hashes = optimal_num_hashes(num_bits, expected_items);
+
+        Self::with_num_bits(num_bits, num_hashes)
+    }
+
+    pub fn num_bits(&self) -> usize {
+        self.bits.num_bits()
+    }
+
+    pub fn num_hashes(&self) -> u32 {
+        self.num_hashes
+    }
+
+    pub fn expected_density(&self, inserted_items: usize) -> f64 {
+        expected_density(self.num_bits(), self.num_hashes(), inserted_items)
+    }
+
+    pub fn expected_false_positive_rate(&self, inserted_items: usize) -> f64 {
+        expected_false_positive_rate(self.num_bits(), self.num_hashes(), inserted_items)
+    }
+
+    pub fn insert<T: Hash + ?Sized>(&self, value: &T) -> bool {
+        let mut previously_contained = true;
+
+        let h1 = hash_with_seed(value, 0);
+        let first_index = index(self.num_bits(), h1);
+
+        previously_contained &= self.bits.set(first_index);
+
+        if self.num_hashes == 1 {
+            return previously_contained;
+        }
+
+        let h2 = hash_with_seed(value, 1);
+
+        for i in 1..self.num_hashes {
+            let hash = nth_hash(h1, h2, i as u64);
+            let bit_index = index(self.num_bits(), hash);
+
+            previously_contained &= self.bits.set(bit_index);
+        }
+
+        previously_contained
+    }
+
+    pub fn contains<T: Hash + ?Sized>(&self, value: &T) -> bool {
+        let h1 = hash_with_seed(value, 0);
+        let first_index = index(self.num_bits(), h1);
+
+        if !self.bits.check(first_index) {
+            return false;
+        }
+
+        if self.num_hashes == 1 {
+            return true;
+        }
+
+        let h2 = hash_with_seed(value, 1);
+
+        for i in 1..self.num_hashes {
+            let hash = nth_hash(h1, h2, i as u64);
+            let bit_index = index(self.num_bits(), hash);
+
+            if !self.bits.check(bit_index) {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 impl BitVec64 {
