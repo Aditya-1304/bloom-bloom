@@ -508,6 +508,8 @@ key prep ns/key = elapsed nanoseconds / 10,000,000 prepared keys
 
 The lookup numbers are parallel throughput across 16 Rayon threads, not isolated single-lookup latency.
 
+![alt text](new-benchmark.png)
+
 | Operation | Total Time | Nanoseconds Per Operation | Notes |
 | --- | ---: | ---: | --- |
 | Key preparation | `75.373243 ms` | `7.54 ns/key` | Prepares 5M present keys and 5M missing keys |
