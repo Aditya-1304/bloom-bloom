@@ -30,7 +30,8 @@ fn main() {
     (0..expected_items as u64)
         .into_par_iter()
         .for_each(|value| {
-            filter.insert(&value);
+            let key = value.to_be_bytes();
+            filter.insert_key(&key);
         });
 
     let insert_elapsed = start.elapsed();
@@ -39,7 +40,10 @@ fn main() {
 
     let present_hits = (0..expected_items as u64)
         .into_par_iter()
-        .filter(|value| filter.contains(value))
+        .filter(|value| {
+            let key = value.to_be_bytes();
+            filter.contains_key(&key)
+        })
         .count();
 
     let present_lookup_elapsed = start.elapsed();
@@ -50,7 +54,10 @@ fn main() {
 
     let false_positives = (missing_start..missing_start + expected_items as u64)
         .into_par_iter()
-        .filter(|value| filter.contains(value))
+        .filter(|value| {
+            let key = value.to_be_bytes();
+            filter.contains_key(&key)
+        })
         .count();
 
     let missing_lookup_elapsed = start.elapsed();
