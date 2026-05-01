@@ -9,6 +9,8 @@ const BLOOM_VERSION: u32 = 1;
 pub const BLOOM_HASH_SEED: u64 = 0xD6E8_FD9A_2C4B_1A37;
 const BLOCK_INDEX_BITS: u32 = 9;
 const BLOCK_MASK: u64 = (BLOCK_BITS as u64) - 1;
+const HEADER_LEN: usize = 8 + 4 + 8 + 8 + 4;
+const MAX_HASHES: u32 = 64;
 
 #[repr(align(64))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +47,18 @@ impl Block {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BloomConfig {
+    pub expected_items: usize,
+    pub false_positive_rate: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LookupPlan {
+    block_index: usize,
+    bit_hash: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BloomFilter {
     blocks: Vec<Block>,
@@ -55,6 +69,10 @@ impl BloomFilter {
     pub fn with_num_bits(num_bits: usize, num_hashes: u32) -> Self {
         assert!(num_bits > 0, "Bloom filter must have at least one bit");
         assert!(num_hashes > 0, "Bloom filter must use at least one hash");
+        assert!(
+            num_hashes <= MAX_HASHES,
+            "Bloom filter hash count is too large"
+        );
 
         let num_blocks = num_bits.div_ceil(BLOCK_BITS).max(1);
 
@@ -211,7 +229,7 @@ impl BloomFilter {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 + self.num_bits() / 8);
+        let mut out = Vec::with_capacity(self.serialized_len());
 
         out.extend_from_slice(&BLOOM_MAGIC);
         out.extend_from_slice(&BLOOM_VERSION.to_le_bytes());
@@ -229,7 +247,7 @@ impl BloomFilter {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BloomDecodeError> {
-        let header_len = 8 + 4 + 8 + 8 + 4;
+        let header_len = HEADER_LEN;
 
         if bytes.len() < header_len {
             return Err(BloomDecodeError::TooShort);
@@ -249,18 +267,30 @@ impl BloomFilter {
             return Err(BloomDecodeError::WrongHashSeed(seed));
         }
 
-        let num_blocks = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
+        let num_blocks_u64 = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
+
+        let num_blocks =
+            usize::try_from(num_blocks_u64).map_err(|_| BloomDecodeError::LengthOverflow)?;
+
         let num_hashes = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
 
         if num_blocks == 0 {
             return Err(BloomDecodeError::InvalidNumBlocks);
         }
 
-        if num_hashes == 0 {
+        if num_hashes == 0 || num_hashes > MAX_HASHES {
             return Err(BloomDecodeError::InvalidNumHashes);
         }
 
-        let expected_len = header_len + num_blocks * BLOCK_WORDS * 8;
+        let payload_len = num_blocks
+            .checked_mul(BLOCK_WORDS)
+            .and_then(|x| x.checked_mul(8))
+            .ok_or(BloomDecodeError::LengthOverflow)?;
+
+        let expected_len = HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or(BloomDecodeError::LengthOverflow)?;
+
         if bytes.len() != expected_len {
             return Err(BloomDecodeError::LengthMismatch);
         }
@@ -280,6 +310,162 @@ impl BloomFilter {
         }
 
         Ok(Self { blocks, num_hashes })
+    }
+
+    pub fn from_config(config: BloomConfig) -> Self {
+        Self::with_false_positive_rate(config.expected_items, config.false_positive_rate)
+    }
+
+    pub fn may_contain_key(&self, key: &[u8]) -> bool {
+        self.contains_key(key)
+    }
+
+    pub fn may_contain_str(&self, key: &str) -> bool {
+        self.contains_str(key)
+    }
+
+    pub fn clear(&mut self) {
+        for block in &mut self.blocks {
+            block.words.fill(0);
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.num_blocks() * BLOCK_WORDS * 8
+    }
+
+    pub fn serialized_len(&self) -> usize {
+        HEADER_LEN + self.byte_len()
+    }
+
+    pub fn count_may_contain<T: AsRef<[u8]>>(&self, keys: &[T]) -> usize {
+        keys.iter()
+            .filter(|key| self.may_contain_key(key.as_ref()))
+            .count()
+    }
+
+    #[inline(always)]
+    fn lookup_plan(&self, key: &[u8]) -> LookupPlan {
+        let hash = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
+
+        LookupPlan {
+            block_index: index(self.num_blocks(), hash as u64),
+            bit_hash: (hash >> 64) as u64,
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_block(&self, block_index: usize) {
+        #[cfg(all(feature = "prefetch", target_arch = "x86_64"))]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+
+            let ptr = self.blocks.as_ptr().add(block_index) as *const i8;
+            _mm_prefetch(ptr, _MM_HINT_T0);
+        }
+
+        #[cfg(not(all(feature = "prefetch", target_arch = "x86_64")))]
+        {
+            let _ = block_index;
+        }
+    }
+
+    #[inline(always)]
+    fn contains_planned(&self, plan: LookupPlan) -> bool {
+        let block = &self.blocks[plan.block_index];
+
+        if self.num_hashes == 7 {
+            let [b0, b1, b2, b3, b4, b5, b6] = block_bit_indexes_7(plan.bit_hash);
+
+            return block.check(b0)
+                && block.check(b1)
+                && block.check(b2)
+                && block.check(b3)
+                && block.check(b4)
+                && block.check(b5)
+                && block.check(b6);
+        }
+
+        if self.num_hashes < 7 {
+            let mut bit_hash = plan.bit_hash;
+
+            for _ in 0..self.num_hashes {
+                if !block.check(take_block_bit_index(&mut bit_hash)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        for bit_index in block_bit_indexes(plan.bit_hash, self.num_hashes) {
+            if !block.check(bit_index) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[inline(always)]
+    fn contains_planned_branchless(&self, plan: LookupPlan) -> bool {
+        let block = &self.blocks[plan.block_index];
+
+        if self.num_hashes == 7 {
+            return check7_branchless(block, plan.bit_hash);
+        }
+
+        self.contains_planned(plan)
+    }
+
+    pub fn count_may_contain_keys_prefetch(&self, keys: &[&[u8]]) -> usize {
+        const BATCH_SIZE: usize = 32;
+
+        let mut count = 0;
+
+        for chunk in keys.chunks(BATCH_SIZE) {
+            let mut plans = [LookupPlan {
+                block_index: 0,
+                bit_hash: 0,
+            }; BATCH_SIZE];
+
+            for (i, key) in chunk.iter().enumerate() {
+                let plan = self.lookup_plan(*key);
+                self.prefetch_block(plan.block_index);
+                plans[i] = plan;
+            }
+
+            for plan in plans.iter().take(chunk.len()) {
+                count += self.contains_planned(*plan) as usize;
+            }
+        }
+
+        count
+    }
+
+    pub fn count_may_contain_keys_prefetch_branchless(&self, keys: &[&[u8]]) -> usize {
+        const BATCH_SIZE: usize = 32;
+
+        let mut count = 0;
+
+        for chunk in keys.chunks(BATCH_SIZE) {
+            let mut plans = [LookupPlan {
+                block_index: 0,
+                bit_hash: 0,
+            }; BATCH_SIZE];
+
+            for (i, key) in chunk.iter().enumerate() {
+                let plan = self.lookup_plan(*key);
+                self.prefetch_block(plan.block_index);
+                plans[i] = plan;
+            }
+
+            for plan in plans.iter().take(chunk.len()) {
+                count += self.contains_planned_branchless(*plan) as usize;
+            }
+        }
+
+        count
     }
 }
 
@@ -322,6 +508,21 @@ fn block_bit_indexes_7(bit_hash: u64) -> [usize; 7] {
         ((bit_hash >> 45) & BLOCK_MASK) as usize,
         ((bit_hash >> 54) & BLOCK_MASK) as usize,
     ]
+}
+
+#[inline(always)]
+fn check7_branchless(block: &Block, bit_hash: u64) -> bool {
+    let [b0, b1, b2, b3, b4, b5, b6] = block_bit_indexes_7(bit_hash);
+
+    let c0 = block.check(b0) as u8;
+    let c1 = block.check(b1) as u8;
+    let c2 = block.check(b2) as u8;
+    let c3 = block.check(b3) as u8;
+    let c4 = block.check(b4) as u8;
+    let c5 = block.check(b5) as u8;
+    let c6 = block.check(b6) as u8;
+
+    (c0 & c1 & c2 & c3 & c4 & c5 & c6) != 0
 }
 
 fn mix64(mut x: u64) -> u64 {
@@ -444,6 +645,7 @@ pub enum BloomDecodeError {
     InvalidNumBlocks,
     InvalidNumHashes,
     LengthMismatch,
+    LengthOverflow,
 }
 
 #[cfg(test)]
