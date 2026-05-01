@@ -1,568 +1,595 @@
 # Bloom Bloom
 
-A compact, in-memory Bloom filter implementation in Rust.
+Bloom Bloom is a compact Rust implementation of a deterministic, cache-conscious block Bloom filter.
 
-Bloom Bloom is a focused probabilistic set-membership library. It answers one question quickly:
+It answers one question quickly:
 
-> has this value probably been inserted before?
+> Can this byte key possibly exist?
 
-The answer can be:
+The answer is intentionally asymmetric:
 
-- definitely no, or
-- probably yes.
+- `false`: the key is definitely absent from the completed filter state.
+- `true`: the key may be present, or it may be a false positive.
 
-That tradeoff is the core value of a Bloom filter. It uses a fixed-size bit array and multiple hash probes to provide memory-efficient membership checks with no false negatives for completed inserts, while allowing a configurable false-positive rate.
+This makes Bloom Bloom useful as a fast pre-check before expensive exact work, such as reading an SSTable block from disk, checking a cache shard, or probing a larger index.
 
-This repository currently implements:
+## Current Design
 
-- a packed `u64` bit vector,
-- a mutable single-threaded `BloomFilter`,
-- an atomic `AtomicBloomFilter` for concurrent inserts and reads,
-- configurable bit count and hash count,
-- sizing from expected item count and target false-positive rate,
-- expected density estimation,
-- expected false-positive-rate estimation,
-- double hashing for efficient multi-probe lookup,
-- fast modulo-free index mapping,
-- generic insertion and lookup for any `T: Hash`,
-- unit tests for core bit-vector and Bloom-filter behavior,
-- a Rayon-powered demo binary for parallel insert and lookup measurement.
+Bloom Bloom started as a conventional Bloom filter with generic `T: Hash` values, a packed `Vec<u64>` bit vector, and an atomic variant for concurrent mutation. The current implementation has been redesigned around storage-engine use cases:
 
----
+- deterministic byte-key API: `&[u8]`
+- `xxh3_128_with_seed` hashing
+- fixed hash seed stored in the serialized format
+- 512-bit block layout with 64-byte alignment
+- one block access per key
+- block-aware false-positive-rate sizing
+- manual serialization and checked deserialization
+- normal single-key lookup API
+- batch count APIs
+- optional x86_64 software prefetch
+- branchless batch lookup path for missing-heavy workloads
 
-## Why This Exists
+The core type is now:
 
-A normal set stores the actual values. That is exact, but it can become expensive when the only thing a system needs is a fast pre-check.
+```rust
+pub struct BloomFilter {
+    blocks: Vec<Block>,
+    num_hashes: u32,
+}
+```
 
-Bloom filters are useful when a cheap "probably present" answer can avoid a more expensive operation:
+There is no production `AtomicBloomFilter` in the current design. For SSTables and similar immutable structures, the expected lifecycle is:
 
-- checking whether a key might exist before hitting disk,
-- reducing database or cache lookups,
-- filtering duplicate work,
-- pre-screening URLs, IDs, tokens, or events,
-- building memory-efficient indexing layers,
-- protecting slower exact data structures from unnecessary queries,
-- quickly ruling out missing values in ingestion pipelines.
+```text
+build with &mut BloomFilter
+serialize to disk
+load later
+share read-only through &BloomFilter
+```
 
-The important promise is asymmetric:
-
-- if `contains(value)` returns `false`, the value was not inserted into the completed filter state,
-- if it returns `true`, the value may have been inserted, or it may be a false positive.
-
-That makes Bloom Bloom useful as a fast first line of defense. It is not a replacement for an exact set when exact membership is required.
-
----
+Immutable reads are already thread-safe in Rust as long as callers share `&BloomFilter` or `Arc<BloomFilter>`.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    A[Caller] --> B{API}
-    B --> C[BloomFilter]
-    B --> D[AtomicBloomFilter]
-    C --> E[BitVec64]
-    D --> F[AtomicBitVec64]
-    C --> G[Hash Pipeline]
-    D --> G
-    G --> H[hash_with_seed]
-    H --> I[Double Hashing]
-    I --> J[Index Mapping]
-    J --> E
-    J --> F
+    A[Caller] --> B{Public API}
+    B --> C[insert_key / may_contain_key]
+    B --> D[batch count APIs]
+    B --> E[to_bytes / from_bytes]
+
+    C --> F[XXH3 128-bit hash]
+    D --> F
+
+    F --> G[Low 64 bits: block hash]
+    F --> H[High 64 bits: bit hash]
+
+    G --> I[Multiply-high block index]
+    H --> J[9-bit in-block indexes]
+
+    I --> K[64-byte Block]
+    J --> K
+
+    K --> L["[u64; 8]"]
+    E --> M[Versioned binary format]
 ```
 
-The implementation is intentionally small. The public API is backed by two bit-vector implementations:
+The filter is split into blocks. Each key selects exactly one block, and all of its Bloom probes are checked or set inside that block.
 
-- `BitVec64`, a packed `Vec<u64>` used by `BloomFilter`,
-- `AtomicBitVec64`, a `Vec<AtomicU64>` used by `AtomicBloomFilter`.
+This is the major change from a classic global Bloom filter, where each probe can land anywhere in one large bit array.
 
-Both filters share the same hashing and probability helpers.
+## Block Layout
 
----
+Each block contains eight `u64` words:
+
+```rust
+const BLOCK_WORDS: usize = 8;
+const WORD_BITS: usize = 64;
+const BLOCK_BITS: usize = BLOCK_WORDS * WORD_BITS; // 512
+```
+
+The block type is aligned to 64 bytes:
+
+```rust
+#[repr(align(64))]
+struct Block {
+    words: [u64; 8],
+}
+```
+
+Diagram:
+
+```mermaid
+flowchart LR
+    A[Block: 512 bits / 64 bytes] --> B[word 0: bits 0..63]
+    A --> C[word 1: bits 64..127]
+    A --> D[word 2: bits 128..191]
+    A --> E[word 3: bits 192..255]
+    A --> F[word 4: bits 256..319]
+    A --> G[word 5: bits 320..383]
+    A --> H[word 6: bits 384..447]
+    A --> I[word 7: bits 448..511]
+```
+
+Mapping a bit inside a block is simple:
+
+```rust
+let word_index = bit_index >> 6; // bit_index / 64
+let bit_offset = bit_index & 63; // bit_index % 64
+let mask = 1u64 << bit_offset;
+```
+
+## Hashing
+
+Bloom Bloom hashes byte keys with:
+
+```rust
+xxh3_128_with_seed(key, BLOOM_HASH_SEED)
+```
+
+The 128-bit hash is split into two independent-looking halves:
+
+```text
+low 64 bits  -> choose the block
+high 64 bits -> choose bit positions inside that block
+```
+
+This separation matters. Earlier versions used derived hashes over one global bit array. In the block layout, using the same hash bits for both block selection and in-block bit selection can create correlation and raise the false-positive rate.
+
+Current lookup shape:
+
+```mermaid
+flowchart TD
+    A[key bytes] --> B[XXH3 128-bit hash]
+    B --> C[low 64 bits]
+    B --> D[high 64 bits]
+    C --> E[block_index = index(num_blocks, low64)]
+    D --> F[extract 9-bit bit indexes]
+    E --> G[selected 512-bit block]
+    F --> G
+```
+
+## In-Block Probes
+
+A block has 512 bits:
+
+```text
+512 = 2^9
+```
+
+So one in-block bit index needs 9 bits of entropy.
+
+For the common `num_hashes == 7` case:
+
+```text
+7 * 9 = 63 bits
+```
+
+That fits inside the high 64-bit half of the XXH3 hash. Bloom Bloom has a manually unrolled fast path for this case:
+
+```text
+bits 0..8   -> probe 0
+bits 9..17  -> probe 1
+bits 18..26 -> probe 2
+bits 27..35 -> probe 3
+bits 36..44 -> probe 4
+bits 45..53 -> probe 5
+bits 54..62 -> probe 6
+```
+
+For fewer than seven probes, the filter consumes fewer 9-bit chunks. For more than seven probes, it re-mixes the high 64-bit state with a SplitMix-style mixer and continues producing indexes.
+
+## Insert Flow
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Filter as BloomFilter
+    participant Hash as XXH3
+    participant Block as Selected Block
+
+    Caller->>Filter: insert_key(key)
+    Filter->>Hash: hash key with fixed seed
+    Hash-->>Filter: 128-bit hash
+    Filter->>Filter: low64 -> block index
+    Filter->>Filter: high64 -> in-block bit indexes
+    Filter->>Block: set each probe bit
+    Block-->>Filter: whether each bit was already set
+    Filter-->>Caller: true if all probe bits were already set
+```
+
+`insert_key` returns:
+
+- `false`: at least one bit changed from `0` to `1`.
+- `true`: all target bits were already set.
+
+Because Bloom filters allow collisions, `true` means "probably already represented", not "this exact key was definitely inserted before."
+
+## Lookup Flow
+
+```mermaid
+flowchart TD
+    A[may_contain_key key] --> B[XXH3 128-bit hash]
+    B --> C[select one block]
+    B --> D[derive in-block probes]
+    C --> E[read selected block]
+    D --> E
+    E --> F{all probe bits set?}
+    F -->|no| G[definitely absent]
+    F -->|yes| H[may be present]
+```
+
+The normal single-key lookup path short-circuits on the first missing bit. This is simple and good for ordinary lookups.
+
+The batch branchless path checks all seven bits and combines the results without short-circuiting. That can be faster for large missing-heavy batches because random early exits can be hard for the CPU branch predictor.
+
+## Serialization Format
+
+Bloom Bloom serializes to an explicit little-endian binary format:
+
+```text
+offset  size  field
+0       8     magic: "BLMFILT1"
+8       4     version: u32
+12      8     hash seed: u64
+20      8     num_blocks: u64
+28      4     num_hashes: u32
+32      ...   block words: num_blocks * 8 * u64
+```
+
+```mermaid
+flowchart LR
+    A[to_bytes] --> B[magic]
+    B --> C[version]
+    C --> D[hash seed]
+    D --> E[num blocks]
+    E --> F[num hashes]
+    F --> G[raw block words]
+
+    H[from_bytes] --> I[validate header]
+    I --> J[checked length math]
+    J --> K[decode block words]
+    K --> L[BloomFilter]
+```
+
+Deserialization checks:
+
+- input length is at least the header length
+- magic matches
+- version is supported
+- hash seed matches
+- block count is nonzero
+- hash count is between `1` and `MAX_HASHES`
+- payload length arithmetic does not overflow
+- byte length matches exactly
+
+This makes the format suitable for SSTable metadata blocks and other persisted storage.
+
+## Public API
+
+### Constructing A Filter
+
+```rust
+use bloom_bloom::BloomFilter;
+
+let mut filter = BloomFilter::with_false_positive_rate(100_000, 0.01);
+```
+
+Or use explicit sizing:
+
+```rust
+let filter = BloomFilter::with_num_bits(1_048_576, 7);
+```
+
+Or a config object:
+
+```rust
+use bloom_bloom::{BloomConfig, BloomFilter};
+
+let config = BloomConfig {
+    expected_items: 100_000,
+    false_positive_rate: 0.01,
+};
+
+let filter = BloomFilter::from_config(config);
+```
+
+### Inserting Keys
+
+```rust
+let mut filter = BloomFilter::with_false_positive_rate(10_000, 0.01);
+
+let was_probably_present = filter.insert_key(b"alice");
+assert!(!was_probably_present);
+
+filter.insert_str("bob");
+```
+
+The preferred API is byte-based:
+
+```rust
+insert_key(&mut self, key: &[u8])
+```
+
+This is intentional. Storage engines, network protocols, caches, and file formats all eventually operate on bytes. It also avoids unstable or version-dependent Rust `Hash` output.
+
+### Checking Keys
+
+```rust
+assert!(filter.may_contain_key(b"alice"));
+
+if !filter.may_contain_key(b"carol") {
+    // definitely absent
+}
+```
+
+`contains_key` and `contains_str` are also available as aliases, but `may_contain_key` better communicates Bloom-filter semantics.
+
+### Batch Counting
+
+For ergonomic batch counting:
+
+```rust
+let keys = vec![b"alice".to_vec(), b"bob".to_vec(), b"carol".to_vec()];
+let count = filter.count_may_contain(&keys);
+```
+
+For a performance-oriented borrowed-slice path:
+
+```rust
+let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+
+let count = filter.count_may_contain_keys_prefetch(&key_refs);
+let branchless_count = filter.count_may_contain_keys_prefetch_branchless(&key_refs);
+```
+
+The prefetch methods are useful for large batch workloads. They process keys in stack-allocated chunks of 32 lookup plans, optionally prefetching blocks before checking them.
+
+```mermaid
+flowchart TD
+    A[key batch] --> B[chunks of 32]
+    B --> C[compute lookup plans]
+    C --> D[prefetch selected blocks]
+    D --> E[check planned lookups]
+    E --> F[count may-contain results]
+```
+
+Hardware prefetch is behind a feature flag:
+
+```bash
+cargo run --release --features prefetch
+```
+
+Without the feature, the batch method still works and the prefetch call compiles to a no-op.
+
+### Serialization
+
+```rust
+let bytes = filter.to_bytes();
+let loaded = BloomFilter::from_bytes(&bytes)?;
+```
+
+This is the API you would use to write the filter into an SSTable footer or metadata block.
+
+### Size And Probability Helpers
+
+```rust
+println!("blocks: {}", filter.num_blocks());
+println!("bits: {}", filter.num_bits());
+println!("hashes: {}", filter.num_hashes());
+println!("payload bytes: {}", filter.byte_len());
+println!("serialized bytes: {}", filter.serialized_len());
+
+println!(
+    "estimated fp rate: {:.4}",
+    filter.expected_false_positive_rate(100_000)
+);
+```
+
+Free helper functions are also exposed:
+
+- `optimal_num_bits`
+- `optimal_num_hashes`
+- `expected_density`
+- `expected_false_positive_rate`
+- `expected_block_false_positive_rate`
+
+## LSM / SSTable Usage
+
+Bloom Bloom is especially suited for immutable table filters.
+
+```mermaid
+sequenceDiagram
+    participant Mem as MemTable Flush
+    participant BF as BloomFilter
+    participant SST as SSTable File
+    participant Read as Reader
+
+    Mem->>BF: insert_key(user_key)
+    Mem->>BF: insert_key(tombstone_key)
+    BF->>SST: to_bytes()
+    SST-->>Read: load metadata
+    Read->>BF: from_bytes()
+    Read->>BF: may_contain_key(user_key)
+    BF-->>Read: false -> skip SSTable
+    BF-->>Read: true -> check table index/data blocks
+```
+
+Important storage-engine notes:
+
+- Hash the user key, not an internal key with a timestamp, unless your lookup path can reproduce that exact internal key.
+- Insert tombstone keys into the filter. A tombstone is still an entry for that key.
+- Build the filter completely before publishing the SSTable.
+- Share the loaded filter immutably between readers.
+- Keep `BLOOM_HASH_SEED` and the serialized format stable across database versions.
+
+## Running The Project
+
+Run tests:
+
+```bash
+cargo test
+```
+
+Run the benchmark/demo binary with the default `1_000_000` item workload:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release
+```
+
+Run with a larger workload:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release -- 5000000
+```
+
+Run with hardware prefetch enabled:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --features prefetch -- 5000000
+```
+
+The demo:
+
+1. prepares present and missing byte keys,
+2. builds the filter,
+3. serializes and deserializes it,
+4. compares normal lookup, batched lookup, and branchless batched lookup,
+5. prints the measured false-positive rate.
+
+## Performance Notes
+
+The main performance choices are:
+
+- `xxh3_128_with_seed` gives one deterministic 128-bit hash per key.
+- The low hash half selects one 512-bit block.
+- The high hash half selects bit positions inside that block.
+- The common 7-probe case is manually unrolled.
+- Bit positions inside a block are extracted with shifts and masks.
+- Multiply-high range reduction avoids `%` for block selection.
+- Batch lookup uses stack-allocated lookup plans instead of heap allocation.
+- Optional prefetch can help when filters are large enough to miss cache.
+- Branchless batch lookup can outperform short-circuit lookup for random missing-heavy workloads.
+
+Single-key lookup and batch throughput measure different things. Batch numbers can look extremely small per key because Rayon spreads work across many CPU threads. That is throughput, not isolated single-key latency.
+
+### Benchmark Snapshot
+
+Example run on a 5,000,000-key workload:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --features prefetch -- 5000000
+```
+
+Configuration:
+
+```text
+expected items:      5,000,000
+target fp rate:      0.01
+num bits:            49,518,080
+num hashes:          7
+num blocks:          96,715
+serialized bytes:    6,189,792
+serialized MiB:      5.90
+rayon threads:       16
+prefetch feature:    true
+estimated density:   0.5068
+estimated fp rate:   0.0100
+measured fp rate:    0.0101
+```
+
+Per-operation conversions below use:
+
+```text
+lookup ns/op = elapsed nanoseconds / 5,000,000 lookups
+insert ns/op = elapsed nanoseconds / 5,000,000 inserts
+key prep ns/key = elapsed nanoseconds / 10,000,000 prepared keys
+```
+
+The lookup numbers are parallel throughput across 16 Rayon threads, not isolated single-lookup latency.
+
+| Operation | Total Time | Nanoseconds Per Operation | Notes |
+| --- | ---: | ---: | --- |
+| Key preparation | `75.373243 ms` | `7.54 ns/key` | Prepares 5M present keys and 5M missing keys |
+| Build insert | `47.405010 ms` | `9.48 ns/insert` | Sequential construction of the immutable filter |
+| Serialize + load | `4.031543 ms` | `0.81 ns/key amortized` | Full-filter serialization plus deserialization |
+| Normal present lookup | `6.806991 ms` | `1.36 ns/lookup` | Parallel short-circuit lookup |
+| Normal missing lookup | `9.252004 ms` | `1.85 ns/lookup` | Parallel short-circuit lookup; branch prediction can make misses slower |
+| Batched present lookup | `4.326980 ms` | `0.87 ns/lookup` | Chunked batch lookup with planned probes |
+| Batched missing lookup | `6.887766 ms` | `1.38 ns/lookup` | Chunked batch lookup with planned probes |
+| Branchless present lookup | `4.716853 ms` | `0.94 ns/lookup` | Checks all seven probes without early exit |
+| Branchless missing lookup | `4.580710 ms` | `0.92 ns/lookup` | Best path here for random missing-heavy batches |
+
+The branchless missing result is faster than the normal missing result because it avoids unpredictable early-exit branches. A normal missing lookup often checks fewer Bloom bits, but the first missing bit appears at a random probe position, which can be expensive for the CPU branch predictor.
+
+## Correctness Boundaries
+
+Bloom Bloom guarantees:
+
+- no false negatives for keys inserted into a completed filter state,
+- deterministic behavior for the same serialized format and hash seed,
+- checked decoding of serialized filters,
+- configurable false-positive targets based on expected item count.
+
+Bloom Bloom does not guarantee:
+
+- exact membership,
+- deletion of individual keys,
+- listing inserted keys,
+- stable results if the hash seed or serialized format changes,
+- thread-safe mutation through shared references.
+
+For concurrent reads, share the completed filter immutably. For concurrent writes, use external synchronization or build separate filters and merge at a higher level.
 
 ## Repository Layout
 
 ```text
 src/
-  lib.rs      # Bloom filter, bit vectors, hashing, probability helpers, tests
-  main.rs     # Rayon demo for the atomic Bloom filter
+  lib.rs      # block Bloom filter, serialization, probability helpers, tests
+  main.rs     # Rayon-powered throughput demo
 
 Cargo.toml
 Cargo.lock
 ```
 
-The crate is currently compact enough that the library implementation lives in one file. That makes the behavior easy to inspect while the project is still small.
-
----
-
-## Core Concepts
-
-### Bloom filter behavior
-
-A Bloom filter stores bits, not values.
-
-When a value is inserted:
-
-1. the value is hashed,
-2. several bit positions are derived from those hashes,
-3. every selected bit is set to `1`.
-
-When a value is checked:
-
-1. the same bit positions are derived,
-2. if any selected bit is `0`, the value is definitely absent,
-3. if all selected bits are `1`, the value is probably present.
-
-```mermaid
-flowchart LR
-    A[value] --> B[hash probes]
-    B --> C[index 1]
-    B --> D[index 2]
-    B --> E[index k]
-    C --> F[bit array]
-    D --> F
-    E --> F
-```
-
-The filter never stores the original value. That is why it is memory efficient, and also why it cannot list inserted values or remove values safely.
-
-### False positives
-
-False positives happen when a value that was never inserted maps to bit positions that were already set by other values.
-
-Example:
-
-```rust
-let mut filter = bloom_bloom::BloomFilter::with_false_positive_rate(10_000, 0.01);
-
-filter.insert("alice");
-
-assert!(filter.contains("alice"));
-
-if filter.contains("bob") {
-    // "bob" might have been inserted, or this might be a false positive.
-}
-```
-
-The false-positive rate rises as more values are inserted. The configured target is based on the expected item count; heavily exceeding that count makes the filter denser and less selective.
-
-### No false negatives for completed inserts
-
-After a value has been inserted into a non-racing filter state, a lookup for that value should return `true`.
-
-Bloom filters do not unset bits during normal insertion, so an inserted value's required bits remain present.
-
-The atomic filter supports concurrent access, but a lookup racing with an in-progress insert can observe only part of that insert. For strict "insert has happened before lookup" semantics between threads, use normal Rust synchronization around the operation boundary.
-
-### Bit layout
-
-`BitVec64` stores logical bits in `u64` words.
-
-```text
-logical bit index:  0 ... 63   64 ... 127   128 ... 191
-storage word:       word 0      word 1        word 2
-```
-
-The mapping is:
-
-```text
-word_index = index / 64
-bit_offset = index % 64
-mask       = 1 << bit_offset
-```
-
-The implementation uses equivalent bit operations:
-
-```rust
-let word_index = index >> 6;
-let bit_offset = index & 63;
-```
-
-This keeps bit storage compact and avoids allocating one byte or one bool per logical bit.
-
-### Hash probes
-
-Bloom Bloom derives multiple probe positions with double hashing.
-
-The first two base hashes are computed by hashing a seed and the user value:
-
-```rust
-let h1 = hash_with_seed(value, 0);
-let h2 = hash_with_seed(value, 1);
-```
-
-Additional probes are derived as:
-
-```text
-h_i = h1 + i * h2
-```
-
-using wrapping arithmetic.
-
-This avoids running a completely independent hash function for every probe while still giving the filter multiple bit positions per value.
-
-### Index mapping
-
-Hash values are mapped into the bit-vector range with multiply-high reduction:
-
-```rust
-let product = hash as u128 * num_bits as u128;
-let index = (product >> 64) as usize;
-```
-
-This maps a `u64` hash into `0..num_bits` without using `%`.
-
----
-
-## Public API
-
-The crate exposes two main filter types:
-
-- `BloomFilter`, for single-threaded or externally synchronized use,
-- `AtomicBloomFilter`, for shared concurrent inserts and lookups.
-
-It also exposes helper functions for sizing and probability estimates:
-
-- `optimal_num_bits`,
-- `optimal_num_hashes`,
-- `expected_density`,
-- `expected_false_positive_rate`.
-
-### Single-threaded filter
-
-Use `BloomFilter` when you have mutable access to the filter.
-
-```rust
-use bloom_bloom::BloomFilter;
-
-fn main() {
-    let mut filter = BloomFilter::with_num_bits(1024, 3);
-
-    let was_probably_present = filter.insert("hello");
-    assert!(!was_probably_present);
-
-    assert!(filter.contains("hello"));
-    assert!(!filter.contains("goodbye"));
-}
-```
-
-`insert` returns whether all of the value's bits were already set before this call. In practice, that means:
-
-- `false`: at least one bit changed, so this value was definitely new to the filter state,
-- `true`: all bits were already set, so this value was probably already present.
-
-Because Bloom filters allow collisions, `true` is still probabilistic.
-
-### Size by false-positive rate
-
-For most use cases, construct the filter from an expected item count and target false-positive rate.
-
-```rust
-use bloom_bloom::BloomFilter;
-
-fn main() {
-    let expected_items = 100_000;
-    let target_fp_rate = 0.01;
-
-    let mut filter = BloomFilter::with_false_positive_rate(
-        expected_items,
-        target_fp_rate,
-    );
-
-    filter.insert(&42);
-
-    println!("bits: {}", filter.num_bits());
-    println!("hashes: {}", filter.num_hashes());
-    println!(
-        "expected fp rate: {:.4}",
-        filter.expected_false_positive_rate(expected_items)
-    );
-}
-```
-
-The bit count is rounded up to a multiple of 64 so it fits cleanly into the packed `u64` storage.
-
-### Atomic filter
-
-Use `AtomicBloomFilter` when multiple threads need to insert or check values through a shared reference.
-
-```rust
-use bloom_bloom::AtomicBloomFilter;
-use rayon::prelude::*;
-
-fn main() {
-    let filter = AtomicBloomFilter::with_false_positive_rate(100_000, 0.01);
-
-    (0..100_000u64).into_par_iter().for_each(|value| {
-        filter.insert(&value);
-    });
-
-    let hits = (0..100_000u64)
-        .into_par_iter()
-        .filter(|value| filter.contains(value))
-        .count();
-
-    assert_eq!(hits, 100_000);
-}
-```
-
-Internally, each bit is set with an atomic `fetch_or` on the containing `u64` word. This makes concurrent bit-setting safe without a global mutex.
-
-### Probability helpers
-
-The helper functions expose the same math used by the constructors.
-
-```rust
-use bloom_bloom::{
-    expected_density,
-    expected_false_positive_rate,
-    optimal_num_bits,
-    optimal_num_hashes,
-};
-
-fn main() {
-    let expected_items = 50_000;
-    let target_fp_rate = 0.005;
-
-    let bits = optimal_num_bits(expected_items, target_fp_rate);
-    let hashes = optimal_num_hashes(bits, expected_items);
-
-    let density = expected_density(bits, hashes, expected_items);
-    let fp_rate = expected_false_positive_rate(bits, hashes, expected_items);
-
-    println!("bits={bits}, hashes={hashes}");
-    println!("density={density:.4}, fp_rate={fp_rate:.4}");
-}
-```
-
----
-
-## Configuration
-
-Bloom Bloom has two construction styles.
-
-### Explicit sizing
-
-```rust
-let filter = BloomFilter::with_num_bits(1_048_576, 7);
-let atomic = AtomicBloomFilter::with_num_bits(1_048_576, 7);
-```
-
-Use this when you already know the exact bit count and hash count you want.
-
-Validation:
-
-- `num_bits` must be greater than `0`,
-- `num_hashes` must be greater than `0`.
-
-### Probability-based sizing
-
-```rust
-let filter = BloomFilter::with_false_positive_rate(100_000, 0.01);
-let atomic = AtomicBloomFilter::with_false_positive_rate(100_000, 0.01);
-```
-
-Use this when you know the expected number of inserted items and the target false-positive rate.
-
-Validation:
-
-- `expected_items` must be greater than `0`,
-- `false_positive_rate` must be greater than `0.0`,
-- `false_positive_rate` must be less than `1.0`.
-
-The optimal bit count is computed as:
-
-```text
-m = -(n * ln(p)) / (ln(2)^2)
-```
-
-The optimal hash count is computed as:
-
-```text
-k = (m / n) * ln(2)
-```
-
-Where:
-
-- `n` is the expected item count,
-- `p` is the target false-positive rate,
-- `m` is the number of bits,
-- `k` is the number of hash probes.
-
----
-
-## Running the Project
-
-Run tests:
-
-```bash
-cargo test
-```
-
-Run the parallel demo:
-
-```bash
-cargo run --release
-```
-
-The demo creates an `AtomicBloomFilter`, inserts `100_000` integers in parallel with Rayon, checks all inserted values, checks another range of missing values, and prints the measured false-positive rate.
-
-![alt text](image.png)
-
-Exact timings and false-positive counts vary by machine, thread count, compiler settings, and hash distribution.
-
----
-
-## Test Coverage
-
-The current unit tests cover:
-
-| Test | Focus |
-|---|---|
-| `new_bitvec_starts_empty` | new bit vectors start with all bits unset |
-| `set_marks_a_bit` | setting a bit makes it observable |
-| `set_returns_whether_bit_was_already_set` | bit setting reports previous state |
-| `bits_cross_word_boundaries` | indexes across `u64` word boundaries work |
-| `empty_bloom_filter_contains_nothing` | empty filters reject sample values |
-| `inserted_value_is_contained` | inserted values are found |
-| `many_inserted_values_are_contained` | many inserted values remain findable |
-| `insert_reports_whether_all_bits_were_already_set` | insert reports probable prior presence |
-
-Run the full suite with:
-
-```bash
-cargo test
-```
-
----
-
-## Performance Notes
-
-The implementation is built around a few simple performance choices:
-
-- bits are packed into `u64` words,
-- index mapping avoids modulo,
-- multiple probes are derived through double hashing,
-- atomic inserts update a single word at a time with `fetch_or`,
-- the demo uses Rayon to exercise concurrent insertion and lookup.
-
-The main cost per operation is:
-
-```text
-hashing + k bit probes
-```
-
-Where `k` is the number of hash functions configured for the filter.
-
-Increasing `num_hashes` can reduce false positives up to the optimal point, but it also increases CPU work for both insertion and lookup. Increasing `num_bits` reduces density and false positives, but uses more memory.
-
----
-
-## Correctness Boundaries
-
-Bloom Bloom has a deliberately narrow contract.
-
-### What it guarantees
-
-- inserted values are represented by setting all of their probe bits,
-- completed single-threaded inserts are observable by later single-threaded lookups,
-- atomic bit updates are data-race free,
-- `contains` never returns `true` because values are stored directly; it only checks bits,
-- helper functions follow standard Bloom-filter sizing formulas.
-
-
----
-
-## Example Use Cases
-
-### Cache pre-check
-
-```rust
-use bloom_bloom::BloomFilter;
-
-struct CacheIndex {
-    might_exist: BloomFilter,
-}
-
-impl CacheIndex {
-    fn new() -> Self {
-        Self {
-            might_exist: BloomFilter::with_false_positive_rate(1_000_000, 0.01),
-        }
-    }
-
-    fn remember_key(&mut self, key: &str) {
-        self.might_exist.insert(key);
-    }
-
-    fn should_check_cache(&self, key: &str) -> bool {
-        self.might_exist.contains(key)
-    }
-}
-```
-
-If `should_check_cache` returns `false`, the cache lookup can be skipped. If it returns `true`, the exact cache still needs to be checked.
-
-### Duplicate work filter
-
-```rust
-use bloom_bloom::BloomFilter;
-
-fn main() {
-    let mut seen = BloomFilter::with_false_positive_rate(10_000, 0.01);
-
-    for job_id in ["a", "b", "a", "c"] {
-        if seen.insert(job_id) {
-            println!("probably seen before: {job_id}");
-        } else {
-            println!("first time according to filter: {job_id}");
-        }
-    }
-}
-```
-
-This is useful when occasional false positives are acceptable. If skipping a new job would be harmful, use an exact set instead.
-
----
-
 ## Development Commands
 
-Format the code:
+Format:
 
 ```bash
 cargo fmt
 ```
 
-Run tests:
-
-```bash
-cargo test
-```
-
-Run the release demo:
-
-```bash
-cargo run --release
-```
-
-Check the crate without running tests:
+Check:
 
 ```bash
 cargo check
 ```
 
----
+Test:
+
+```bash
+cargo test
+```
+
+Run release demo:
+
+```bash
+cargo run --release
+```
+
+Run release demo with prefetch:
+
+```bash
+cargo run --release --features prefetch
+```
 
 ## Summary
 
-Bloom Bloom is a compact Rust implementation of a classic Bloom filter:
+Bloom Bloom is now a deterministic block Bloom filter, optimized for byte-key workloads and immutable storage structures. It keeps the classic Bloom-filter contract, but changes the memory layout to favor cache locality and persisted use:
 
-- memory-efficient bit storage,
-- generic hashed values,
-- configurable accuracy and capacity,
-- single-threaded and atomic APIs,
-- simple probability helpers,
-- parallel demo workload,
-- focused tests.
+```text
+byte key -> deterministic 128-bit hash -> one 512-bit block -> in-block probes
+```
 
-It is best used as a fast probabilistic pre-check in front of more expensive exact systems. It answers "definitely not" cheaply and "probably yes" with bounded, configurable uncertainty.
+It is best used when a fast "definitely absent" answer can avoid slower exact work.
