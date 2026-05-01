@@ -140,12 +140,12 @@ Current lookup shape:
 
 ```mermaid
 flowchart TD
-    A[key bytes] --> B[XXH3 128-bit hash]
-    B --> C[low 64 bits]
-    B --> D[high 64 bits]
-    C --> E[block_index = index(num_blocks, low64)]
-    D --> F[extract 9-bit bit indexes]
-    E --> G[selected 512-bit block]
+    A["key bytes"] --> B["XXH3 128-bit hash"]
+    B --> C["low 64 bits"]
+    B --> D["high 64 bits"]
+    C --> E["block_index = index(num_blocks, low64)"]
+    D --> F["extract 9-bit bit indexes"]
+    E --> G["selected 512-bit block"]
     F --> G
 ```
 
