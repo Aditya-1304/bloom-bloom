@@ -11,3 +11,4 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 lto = "fat"
 codegen-units = 1
 opt-level = 3
+panic = "abort"

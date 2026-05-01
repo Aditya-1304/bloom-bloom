@@ -17,12 +17,14 @@ struct Block {
 }
 
 impl Block {
+    #[inline(always)]
     fn empty() -> Self {
         Self {
             words: [0; BLOCK_WORDS],
         }
     }
 
+    #[inline(always)]
     fn set(&mut self, bit_index: usize) -> bool {
         let word_index = bit_index >> 6;
         let bit_offset = bit_index & 63;
@@ -33,6 +35,7 @@ impl Block {
         was_set
     }
 
+    #[inline(always)]
     fn check(&self, bit_index: usize) -> bool {
         let word_index = bit_index >> 6;
         let bit_offset = bit_index & 63;
@@ -97,19 +100,42 @@ impl BloomFilter {
     }
 
     pub fn expected_false_positive_rate(&self, inserted_items: usize) -> f64 {
-        expected_false_positive_rate(self.num_bits(), self.num_hashes(), inserted_items)
+        expected_block_false_positive_rate(self.num_blocks(), self.num_hashes(), inserted_items)
     }
 
     pub fn insert_key(&mut self, key: &[u8]) -> bool {
         let hash = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
 
         let block_hash = hash as u64;
-        let bit_hash = (hash >> 64) as u64;
+        let mut bit_hash = (hash >> 64) as u64;
 
         let block_index = index(self.num_blocks(), block_hash);
         let block = &mut self.blocks[block_index];
 
+        if self.num_hashes == 7 {
+            let [b0, b1, b2, b3, b4, b5, b6] = block_bit_indexes_7(bit_hash);
+
+            let mut all_set = block.set(b0);
+            all_set &= block.set(b1);
+            all_set &= block.set(b2);
+            all_set &= block.set(b3);
+            all_set &= block.set(b4);
+            all_set &= block.set(b5);
+            all_set &= block.set(b6);
+
+            return all_set;
+        }
+
         let mut previously_contained = true;
+
+        if self.num_hashes < 7 {
+            for _ in 0..self.num_hashes {
+                let bit_index = take_block_bit_index(&mut bit_hash);
+                previously_contained &= block.set(bit_index);
+            }
+
+            return previously_contained;
+        }
 
         for bit_index in block_bit_indexes(bit_hash, self.num_hashes) {
             previously_contained &= block.set(bit_index);
@@ -122,10 +148,50 @@ impl BloomFilter {
         let hash = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
 
         let block_hash = hash as u64;
-        let bit_hash = (hash >> 64) as u64;
+        let mut bit_hash = (hash >> 64) as u64;
 
         let block_index = index(self.num_blocks(), block_hash);
         let block = &self.blocks[block_index];
+
+        if self.num_hashes == 7 {
+            let [b0, b1, b2, b3, b4, b5, b6] = block_bit_indexes_7(bit_hash);
+
+            if !block.check(b0) {
+                return false;
+            }
+            if !block.check(b1) {
+                return false;
+            }
+            if !block.check(b2) {
+                return false;
+            }
+            if !block.check(b3) {
+                return false;
+            }
+            if !block.check(b4) {
+                return false;
+            }
+            if !block.check(b5) {
+                return false;
+            }
+            if !block.check(b6) {
+                return false;
+            }
+
+            return true;
+        }
+
+        if self.num_hashes < 7 {
+            for _ in 0..self.num_hashes {
+                let bit_index = take_block_bit_index(&mut bit_hash);
+
+                if !block.check(bit_index) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
 
         for bit_index in block_bit_indexes(bit_hash, self.num_hashes) {
             if !block.check(bit_index) {
@@ -238,6 +304,26 @@ fn block_bit_indexes(bit_hash: u64, num_hashes: u32) -> impl Iterator<Item = usi
     })
 }
 
+#[inline(always)]
+fn take_block_bit_index(bit_hash: &mut u64) -> usize {
+    let bit_index = (*bit_hash & BLOCK_MASK) as usize;
+    *bit_hash >>= BLOCK_INDEX_BITS;
+    bit_index
+}
+
+#[inline(always)]
+fn block_bit_indexes_7(bit_hash: u64) -> [usize; 7] {
+    [
+        (bit_hash & BLOCK_MASK) as usize,
+        ((bit_hash >> 9) & BLOCK_MASK) as usize,
+        ((bit_hash >> 18) & BLOCK_MASK) as usize,
+        ((bit_hash >> 27) & BLOCK_MASK) as usize,
+        ((bit_hash >> 36) & BLOCK_MASK) as usize,
+        ((bit_hash >> 45) & BLOCK_MASK) as usize,
+        ((bit_hash >> 54) & BLOCK_MASK) as usize,
+    ]
+}
+
 fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -279,6 +365,7 @@ pub fn optimal_num_hashes(num_bits: usize, expected_items: usize) -> u32 {
     hashes.max(1)
 }
 
+#[inline(always)]
 fn index(num_bits: usize, hash: u64) -> usize {
     assert!(num_bits > 0, "num_bits must be greater than 0");
 
