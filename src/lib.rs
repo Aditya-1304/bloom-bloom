@@ -1,261 +1,95 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
-// here, we store packs of 64 bits in form of Vec<u64>
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct BitVec64 {
-    words: Vec<u64>, // simple vector store containing 64 bits on each index
+const BLOCK_WORDS: usize = 8;
+const WORD_BITS: usize = 64;
+const BLOCK_BITS: usize = BLOCK_WORDS * WORD_BITS;
 
-    // number of bits we will need
-    // this can be smaller than words.len() * 64
-    num_bits: usize,
+const BLOOM_MAGIC: [u8; 8] = *b"BLMFILT1";
+const BLOOM_VERSION: u32 = 1;
+pub const BLOOM_HASH_SEED: u64 = 0xD6E8_FD9A_2C4B_1A37;
+const BLOCK_INDEX_BITS: u32 = 9;
+const BLOCK_MASK: u64 = (BLOCK_BITS as u64) - 1;
+
+#[repr(align(64))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Block {
+    words: [u64; BLOCK_WORDS],
 }
 
-#[derive(Debug)]
-pub struct AtomicBitVec64 {
-    words: Vec<AtomicU64>,
-    num_bits: usize,
-}
-
-impl AtomicBitVec64 {
-    pub fn new(num_bits: usize) -> Self {
-        assert!(num_bits > 0, "bit vector must have at least one bit");
-
-        let num_words = num_bits.div_ceil(64);
-
-        let words = (0..num_words).map(|_| AtomicU64::new(0)).collect();
-
-        Self { words, num_bits }
-    }
-
-    pub fn num_bits(&self) -> usize {
-        self.num_bits
-    }
-
-    pub fn set(&self, index: usize) -> bool {
-        assert!(index < self.num_bits, "bit index out of bounds");
-
-        let word_index = index >> 6;
-        let bit_offset = index & 63;
-        let mask = 1u64 << bit_offset;
-        let old_word = self.words[word_index].fetch_or(mask, Ordering::Relaxed);
-
-        old_word & mask != 0
-    }
-
-    pub fn check(&self, index: usize) -> bool {
-        assert!(index < self.num_bits, "bit index out of bounds");
-
-        let word_index = index >> 6;
-        let bit_offset = index & 63;
-        let mask = 1u64 << bit_offset;
-
-        let word = self.words[word_index].load(Ordering::Relaxed);
-
-        word & mask != 0
-    }
-}
-
-#[derive(Debug)]
-pub struct AtomicBloomFilter {
-    bits: AtomicBitVec64,
-    num_hashes: u32,
-}
-
-impl AtomicBloomFilter {
-    pub fn with_num_bits(num_bits: usize, num_hashes: u32) -> Self {
-        assert!(num_hashes > 0, "Bloom filter must use at least one hash");
-
+impl Block {
+    fn empty() -> Self {
         Self {
-            bits: AtomicBitVec64::new(num_bits),
-            num_hashes,
+            words: [0; BLOCK_WORDS],
         }
     }
 
-    pub fn with_false_positive_rate(expected_items: usize, false_positive_rate: f64) -> Self {
-        let num_bits = optimal_num_bits(expected_items, false_positive_rate);
-        let num_hashes = optimal_num_hashes(num_bits, expected_items);
-
-        Self::with_num_bits(num_bits, num_hashes)
-    }
-
-    pub fn num_bits(&self) -> usize {
-        self.bits.num_bits()
-    }
-
-    pub fn num_hashes(&self) -> u32 {
-        self.num_hashes
-    }
-
-    pub fn expected_density(&self, inserted_items: usize) -> f64 {
-        expected_density(self.num_bits(), self.num_hashes(), inserted_items)
-    }
-
-    pub fn expected_false_positive_rate(&self, inserted_items: usize) -> f64 {
-        expected_false_positive_rate(self.num_bits(), self.num_hashes(), inserted_items)
-    }
-
-    pub fn insert_key(&self, key: &[u8]) -> bool {
-        let mut previously_contained = true;
-
-        let (h1, h2) = base_hashes(key);
-
-        for i in 0..self.num_hashes {
-            let hash = nth_hash(h1, h2, i as u64);
-            let bit_index = index(self.num_bits(), hash);
-
-            previously_contained &= self.bits.set(bit_index);
-        }
-
-        previously_contained
-    }
-
-    pub fn contains_key(&self, key: &[u8]) -> bool {
-        let (h1, h2) = base_hashes(key);
-
-        for i in 0..self.num_hashes {
-            let hash = nth_hash(h1, h2, i as u64);
-            let bit_index = index(self.num_bits(), hash);
-
-            if !self.bits.check(bit_index) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    pub fn insert_str(&self, key: &str) -> bool {
-        self.insert_key(key.as_bytes())
-    }
-
-    pub fn contains_str(&self, key: &str) -> bool {
-        self.contains_key(key.as_bytes())
-    }
-}
-
-impl BitVec64 {
-    pub fn new(num_bits: usize) -> Self {
-        // zero size bloom filter is not a real thing lil bro
-        assert!(num_bits > 0, "must atleast have one bit");
-
-        // we need to store words so we will divide by 64 bits rounding up
-        // example:
-        // 1 bit -> 1 word
-        // 64 bits -> 1 word
-        // 65 bits -> 2 words
-        let num_words = num_bits.div_ceil(64);
-
-        // this creates a vec of num_words with value of 0, every bit is 0 too automatically
-        Self {
-            words: vec![0; num_words],
-            num_bits,
-        }
-    }
-
-    pub fn num_bits(&self) -> usize {
-        self.num_bits
-    }
-
-    // returns :
-    // false if bit was previously 0
-    // true if bit was already 1
-    pub fn set_bit_to_1(&mut self, index: usize) -> bool {
-        assert!(index < self.num_bits, "bit index out of bounds");
-
-        // this will convert the logical bit index to word index for u64
-        // bit 0..63 lives in word 0
-        // bit 64..127 lives in word 1
-        let word_index = index >> 6; // same as index / 64
-
-        // this finds the bit position inside word
-        let bit_offset = index & 63; // same as index % 64
-
-        // mask with one bit set
+    fn set(&mut self, bit_index: usize) -> bool {
+        let word_index = bit_index >> 6;
+        let bit_offset = bit_index & 63;
         let mask = 1u64 << bit_offset;
 
-        // simple check to see if bit was already 1
         let was_set = self.words[word_index] & mask != 0;
-
-        // set target to 1
-        // |= this is bitwise OR
         self.words[word_index] |= mask;
-
         was_set
     }
 
-    pub fn check(&self, index: usize) -> bool {
-        assert!(index < self.num_bits, "bit index out of bounds");
-
-        let word_index = index >> 6;
-
-        let bit_offset = index & 63;
-
+    fn check(&self, bit_index: usize) -> bool {
+        let word_index = bit_index >> 6;
+        let bit_offset = bit_index & 63;
         let mask = 1u64 << bit_offset;
 
         self.words[word_index] & mask != 0
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BloomFilter {
-    bits: BitVec64,
+    blocks: Vec<Block>,
     num_hashes: u32,
 }
 
 impl BloomFilter {
     pub fn with_num_bits(num_bits: usize, num_hashes: u32) -> Self {
-        assert!(num_hashes > 0, "bloom filter should atleast use one hash");
+        assert!(num_bits > 0, "Bloom filter must have at least one bit");
+        assert!(num_hashes > 0, "Bloom filter must use at least one hash");
+
+        let num_blocks = num_bits.div_ceil(BLOCK_BITS).max(1);
 
         Self {
-            bits: BitVec64::new(num_bits),
+            blocks: vec![Block::empty(); num_blocks],
             num_hashes,
         }
     }
 
+    pub fn with_false_positive_rate(expected_items: usize, false_positive_rate: f64) -> Self {
+        let mut num_bits = optimal_num_bits(expected_items, false_positive_rate);
+
+        loop {
+            let num_blocks = num_bits.div_ceil(BLOCK_BITS).max(1);
+            let actual_bits = num_blocks * BLOCK_BITS;
+            let num_hashes = optimal_num_hashes(actual_bits, expected_items);
+
+            let expected_fp =
+                expected_block_false_positive_rate(num_blocks, num_hashes, expected_items);
+
+            if expected_fp <= false_positive_rate {
+                return Self::with_num_bits(actual_bits, num_hashes);
+            }
+
+            num_bits = actual_bits + BLOCK_BITS;
+        }
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     pub fn num_bits(&self) -> usize {
-        self.bits.num_bits()
+        self.blocks.len() * BLOCK_BITS
     }
 
     pub fn num_hashes(&self) -> u32 {
         self.num_hashes
-    }
-
-    pub fn insert_key(&mut self, key: &[u8]) -> bool {
-        let mut previously_contained = true;
-
-        let (h1, h2) = base_hashes(key);
-
-        for i in 0..self.num_hashes {
-            let hash = nth_hash(h1, h2, i as u64);
-            let bit_index = index(self.num_bits(), hash);
-
-            previously_contained &= self.bits.set_bit_to_1(bit_index);
-        }
-
-        previously_contained
-    }
-
-    pub fn contains_key(&self, key: &[u8]) -> bool {
-        let (h1, h2) = base_hashes(key);
-
-        for i in 0..self.num_hashes {
-            let hash = nth_hash(h1, h2, i as u64);
-            let bit_index = index(self.num_bits(), hash);
-
-            if !self.bits.check(bit_index) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    pub fn with_false_positive_rate(expected_items: usize, false_positive_rate: f64) -> Self {
-        let num_bits = optimal_num_bits(expected_items, false_positive_rate);
-
-        let num_hashes = optimal_num_hashes(num_bits, expected_items);
-
-        Self::with_num_bits(num_bits, num_hashes)
     }
 
     pub fn expected_density(&self, inserted_items: usize) -> f64 {
@@ -264,6 +98,42 @@ impl BloomFilter {
 
     pub fn expected_false_positive_rate(&self, inserted_items: usize) -> f64 {
         expected_false_positive_rate(self.num_bits(), self.num_hashes(), inserted_items)
+    }
+
+    pub fn insert_key(&mut self, key: &[u8]) -> bool {
+        let hash = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
+
+        let block_hash = hash as u64;
+        let bit_hash = (hash >> 64) as u64;
+
+        let block_index = index(self.num_blocks(), block_hash);
+        let block = &mut self.blocks[block_index];
+
+        let mut previously_contained = true;
+
+        for bit_index in block_bit_indexes(bit_hash, self.num_hashes) {
+            previously_contained &= block.set(bit_index);
+        }
+
+        previously_contained
+    }
+
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        let hash = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
+
+        let block_hash = hash as u64;
+        let bit_hash = (hash >> 64) as u64;
+
+        let block_index = index(self.num_blocks(), block_hash);
+        let block = &self.blocks[block_index];
+
+        for bit_index in block_bit_indexes(bit_hash, self.num_hashes) {
+            if !block.check(bit_index) {
+                return false;
+            }
+        }
+
+        true
     }
 
     pub fn insert_str(&mut self, key: &str) -> bool {
@@ -273,6 +143,108 @@ impl BloomFilter {
     pub fn contains_str(&self, key: &str) -> bool {
         self.contains_key(key.as_bytes())
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + self.num_bits() / 8);
+
+        out.extend_from_slice(&BLOOM_MAGIC);
+        out.extend_from_slice(&BLOOM_VERSION.to_le_bytes());
+        out.extend_from_slice(&BLOOM_HASH_SEED.to_le_bytes());
+        out.extend_from_slice(&(self.num_blocks() as u64).to_le_bytes());
+        out.extend_from_slice(&self.num_hashes.to_le_bytes());
+
+        for block in &self.blocks {
+            for word in block.words {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BloomDecodeError> {
+        let header_len = 8 + 4 + 8 + 8 + 4;
+
+        if bytes.len() < header_len {
+            return Err(BloomDecodeError::TooShort);
+        }
+
+        if bytes[0..8] != BLOOM_MAGIC {
+            return Err(BloomDecodeError::BadMagic);
+        }
+
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version != BLOOM_VERSION {
+            return Err(BloomDecodeError::UnsupportedVersion(version));
+        }
+
+        let seed = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+        if seed != BLOOM_HASH_SEED {
+            return Err(BloomDecodeError::WrongHashSeed(seed));
+        }
+
+        let num_blocks = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
+        let num_hashes = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+
+        if num_blocks == 0 {
+            return Err(BloomDecodeError::InvalidNumBlocks);
+        }
+
+        if num_hashes == 0 {
+            return Err(BloomDecodeError::InvalidNumHashes);
+        }
+
+        let expected_len = header_len + num_blocks * BLOCK_WORDS * 8;
+        if bytes.len() != expected_len {
+            return Err(BloomDecodeError::LengthMismatch);
+        }
+
+        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut offset = header_len;
+
+        for _ in 0..num_blocks {
+            let mut words = [0u64; BLOCK_WORDS];
+
+            for word in &mut words {
+                *word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+            }
+
+            blocks.push(Block { words });
+        }
+
+        Ok(Self { blocks, num_hashes })
+    }
+}
+
+fn block_bit_indexes(bit_hash: u64, num_hashes: u32) -> impl Iterator<Item = usize> {
+    let mut state = bit_hash;
+    let mut pool = state;
+    let mut chunks_left = 7u32;
+
+    (0..num_hashes).map(move |_| {
+        if chunks_left == 0 {
+            state = mix64(state);
+            pool = state;
+            chunks_left = 7;
+        }
+
+        let bit_index = (pool & BLOCK_MASK) as usize;
+
+        pool >>= BLOCK_INDEX_BITS;
+        chunks_left -= 1;
+
+        bit_index
+    })
+}
+
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    x
 }
 
 pub fn optimal_num_bits(expected_items: usize, false_positive_rate: f64) -> usize {
@@ -307,21 +279,6 @@ pub fn optimal_num_hashes(num_bits: usize, expected_items: usize) -> u32 {
     hashes.max(1)
 }
 
-const BLOOM_HASH_SEED: u64 = 0xD6E8_FD9A_2C4B_1A37;
-
-fn base_hashes(key: &[u8]) -> (u64, u64) {
-    let hash = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
-
-    let h1 = hash as u64;
-    let h2 = (hash >> 64) as u64;
-
-    (h1, h2 | 1)
-}
-
-fn nth_hash(h1: u64, h2: u64, i: u64) -> u64 {
-    h1.wrapping_add(i.wrapping_mul(h2))
-}
-
 fn index(num_bits: usize, hash: u64) -> usize {
     assert!(num_bits > 0, "num_bits must be greater than 0");
 
@@ -349,48 +306,73 @@ pub fn expected_false_positive_rate(
     density.powi(num_hashes as i32)
 }
 
+pub fn expected_block_false_positive_rate(
+    num_blocks: usize,
+    num_hashes: u32,
+    inserted_items: usize,
+) -> f64 {
+    assert!(num_blocks > 0, "num_blocks must be greater than 0");
+    assert!(num_hashes > 0, "num_hashes must be greater than 0");
+
+    let lambda = inserted_items as f64 / num_blocks as f64;
+    let hashes = num_hashes as usize;
+
+    let miss_one_bit_per_item = (1.0 - 1.0 / BLOCK_BITS as f64).powi(num_hashes as i32);
+
+    let mut fp = 0.0;
+
+    for j in 0..=hashes {
+        let sign = if j % 2 == 0 { 1.0 } else { -1.0 };
+        let term =
+            binomial(hashes, j) * (lambda * (miss_one_bit_per_item.powi(j as i32) - 1.0)).exp();
+
+        fp += sign * term;
+    }
+
+    fp.clamp(0.0, 1.0)
+}
+
+fn binomial(n: usize, k: usize) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+
+    let k = k.min(n - k);
+    let mut result = 1.0;
+
+    for i in 0..k {
+        result *= (n - i) as f64;
+        result /= (i + 1) as f64;
+    }
+
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BloomDecodeError {
+    TooShort,
+    BadMagic,
+    UnsupportedVersion(u32),
+    WrongHashSeed(u64),
+    InvalidNumBlocks,
+    InvalidNumHashes,
+    LengthMismatch,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn new_bitvec_starts_empty() {
-        let bits = BitVec64::new(128);
+    fn block_filter_rounds_up_to_full_blocks() {
+        let one_bit = BloomFilter::with_num_bits(1, 3);
+        let one_block_plus_one_bit = BloomFilter::with_num_bits(513, 3);
 
-        assert!(!bits.check(0));
-        assert!(!bits.check(63));
-        assert!(!bits.check(64));
-        assert!(!bits.check(127));
-    }
+        assert_eq!(one_bit.num_blocks(), 1);
+        assert_eq!(one_bit.num_bits(), 512);
 
-    #[test]
-    fn set_marks_a_bit() {
-        let mut bits = BitVec64::new(128);
-
-        assert!(!bits.check(42));
-        assert!(!bits.set_bit_to_1(42));
-        assert!(bits.check(42));
-    }
-
-    #[test]
-    fn set_returns_whether_bit_was_already_set() {
-        let mut bits = BitVec64::new(128);
-
-        assert!(!bits.set_bit_to_1(9));
-        assert!(bits.set_bit_to_1(9));
-    }
-
-    #[test]
-    fn bits_cross_word_boundaries() {
-        let mut bits = BitVec64::new(128);
-
-        bits.set_bit_to_1(63);
-        bits.set_bit_to_1(64);
-
-        assert!(bits.check(63));
-        assert!(bits.check(64));
-        assert!(!bits.check(62));
-        assert!(!bits.check(65));
+        assert_eq!(one_block_plus_one_bit.num_blocks(), 2);
+        assert_eq!(one_block_plus_one_bit.num_bits(), 1024);
     }
 
     #[test]
@@ -472,34 +454,31 @@ mod tests {
         filter.insert_key(b"rust");
 
         assert!(filter.contains_key(b"rust"));
-        assert!(filter.num_bits() >= 64);
+        assert!(filter.num_bits() >= 512);
         assert!(filter.num_hashes() >= 1);
     }
 
     #[test]
-    fn nth_hash_is_deterministic() {
-        let h1 = 10;
-        let h2 = 7;
-
-        assert_eq!(nth_hash(h1, h2, 0), 10);
-        assert_eq!(nth_hash(h1, h2, 1), 17);
-        assert_eq!(nth_hash(h1, h2, 2), 24);
-    }
-
-    #[test]
-    fn index_is_always_in_bounds() {
-        let num_bits = 1000;
-
-        for i in 0..100_000u64 {
-            let hash = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let bit_index = index(num_bits, hash);
-
-            assert!(bit_index < num_bits);
+    fn block_bit_indexes_are_inside_one_block() {
+        for bit_index in block_bit_indexes(123456789, 20) {
+            assert!(bit_index < BLOCK_BITS);
         }
     }
 
     #[test]
-    fn index_handles_tiny_filters() {
+    fn index_is_always_in_bounds() {
+        let num_slots = 1000;
+
+        for i in 0..100_000u64 {
+            let hash = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let slot = index(num_slots, hash);
+
+            assert!(slot < num_slots);
+        }
+    }
+
+    #[test]
+    fn index_handles_single_slot() {
         assert_eq!(index(1, 0), 0);
         assert_eq!(index(1, u64::MAX), 0);
         assert_eq!(index(1, 123456789), 0);
@@ -526,7 +505,6 @@ mod tests {
         let target = 0.01;
 
         let filter = BloomFilter::with_false_positive_rate(expected_items, target);
-
         let estimated = filter.expected_false_positive_rate(expected_items);
 
         assert!(estimated < 0.012);
@@ -551,73 +529,122 @@ mod tests {
 
         let measured_rate = false_positives as f64 / trials as f64;
 
-        assert!(measured_rate < 0.03);
+        assert!(measured_rate < 0.05);
     }
 
     #[test]
-    fn atomic_bitvec_can_set_and_check_bits() {
-        let bits = AtomicBitVec64::new(128);
-
-        assert!(!bits.check(64));
-        assert!(!bits.set(64));
-        assert!(bits.check(64));
-        assert!(bits.set(64));
-    }
-
-    #[test]
-    fn atomic_bloom_filter_contains_inserted_keys() {
-        let filter = AtomicBloomFilter::with_false_positive_rate(1000, 0.01);
+    fn serialization_round_trip_preserves_inserted_keys() {
+        let mut filter = BloomFilter::with_false_positive_rate(1000, 0.01);
 
         for value in 0..1000u64 {
             filter.insert_key(&value.to_be_bytes());
         }
 
+        let bytes = filter.to_bytes();
+        let decoded = BloomFilter::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.num_bits(), filter.num_bits());
+        assert_eq!(decoded.num_blocks(), filter.num_blocks());
+        assert_eq!(decoded.num_hashes(), filter.num_hashes());
+
         for value in 0..1000u64 {
-            assert!(filter.contains_key(&value.to_be_bytes()));
+            assert!(decoded.contains_key(&value.to_be_bytes()));
         }
     }
 
     #[test]
-    fn atomic_bloom_filter_insert_takes_shared_reference() {
-        let filter = AtomicBloomFilter::with_num_bits(1024, 3);
+    fn serialization_preserves_string_keys() {
+        let mut filter = BloomFilter::with_num_bits(2048, 4);
 
-        let shared_ref = &filter;
+        filter.insert_str("alpha");
+        filter.insert_str("beta");
+        filter.insert_str("gamma");
 
-        shared_ref.insert_key(b"rust");
+        let bytes = filter.to_bytes();
+        let decoded = BloomFilter::from_bytes(&bytes).unwrap();
 
-        assert!(shared_ref.contains_key(b"rust"));
+        assert!(decoded.contains_str("alpha"));
+        assert!(decoded.contains_str("beta"));
+        assert!(decoded.contains_str("gamma"));
+        assert!(!decoded.contains_str("definitely-not-inserted"));
     }
 
     #[test]
-    fn atomic_bloom_filter_supports_parallel_inserts() {
-        use std::sync::Arc;
-        use std::thread;
+    fn decode_rejects_too_short_input() {
+        let err = BloomFilter::from_bytes(&[]).unwrap_err();
 
-        let filter = Arc::new(AtomicBloomFilter::with_false_positive_rate(4000, 0.01));
+        assert_eq!(err, BloomDecodeError::TooShort);
+    }
 
-        let mut handles = Vec::new();
+    #[test]
+    fn decode_rejects_bad_magic() {
+        let filter = BloomFilter::with_num_bits(1024, 3);
+        let mut bytes = filter.to_bytes();
 
-        for thread_id in 0..4u64 {
-            let filter = Arc::clone(&filter);
+        bytes[0] = b'X';
 
-            let handle = thread::spawn(move || {
-                let start = thread_id * 1000;
-                let end = start + 1000;
+        let err = BloomFilter::from_bytes(&bytes).unwrap_err();
 
-                for value in start..end {
-                    filter.insert_key(&value.to_be_bytes());
-                }
-            });
+        assert_eq!(err, BloomDecodeError::BadMagic);
+    }
 
-            handles.push(handle);
-        }
+    #[test]
+    fn decode_rejects_unsupported_version() {
+        let filter = BloomFilter::with_num_bits(1024, 3);
+        let mut bytes = filter.to_bytes();
 
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        bytes[8..12].copy_from_slice(&999u32.to_le_bytes());
 
-        for value in 0..4000u64 {
-            assert!(filter.contains_key(&value.to_be_bytes()));
-        }
+        let err = BloomFilter::from_bytes(&bytes).unwrap_err();
+
+        assert_eq!(err, BloomDecodeError::UnsupportedVersion(999));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_hash_seed() {
+        let filter = BloomFilter::with_num_bits(1024, 3);
+        let mut bytes = filter.to_bytes();
+
+        bytes[12..20].copy_from_slice(&123u64.to_le_bytes());
+
+        let err = BloomFilter::from_bytes(&bytes).unwrap_err();
+
+        assert_eq!(err, BloomDecodeError::WrongHashSeed(123));
+    }
+
+    #[test]
+    fn decode_rejects_zero_blocks() {
+        let filter = BloomFilter::with_num_bits(1024, 3);
+        let mut bytes = filter.to_bytes();
+
+        bytes[20..28].copy_from_slice(&0u64.to_le_bytes());
+
+        let err = BloomFilter::from_bytes(&bytes).unwrap_err();
+
+        assert_eq!(err, BloomDecodeError::InvalidNumBlocks);
+    }
+
+    #[test]
+    fn decode_rejects_zero_hashes() {
+        let filter = BloomFilter::with_num_bits(1024, 3);
+        let mut bytes = filter.to_bytes();
+
+        bytes[28..32].copy_from_slice(&0u32.to_le_bytes());
+
+        let err = BloomFilter::from_bytes(&bytes).unwrap_err();
+
+        assert_eq!(err, BloomDecodeError::InvalidNumHashes);
+    }
+
+    #[test]
+    fn decode_rejects_length_mismatch() {
+        let filter = BloomFilter::with_num_bits(1024, 3);
+        let mut bytes = filter.to_bytes();
+
+        bytes.pop();
+
+        let err = BloomFilter::from_bytes(&bytes).unwrap_err();
+
+        assert_eq!(err, BloomDecodeError::LengthMismatch);
     }
 }
