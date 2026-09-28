@@ -3,6 +3,7 @@ use xxhash_rust::xxh3::xxh3_128_with_seed;
 const BLOCK_WORDS: usize = 8;
 const WORD_BITS: usize = 64;
 const BLOCK_BITS: usize = BLOCK_WORDS * WORD_BITS;
+const BLOCK_BYTES: usize = BLOCK_WORDS * std::mem::size_of::<u64>();
 
 const BLOOM_MAGIC: [u8; 8] = *b"BLMFILT1";
 const BLOOM_VERSION: u32 = 1;
@@ -10,7 +11,16 @@ pub const BLOOM_HASH_SEED: u64 = 0xD6E8_FD9A_2C4B_1A37;
 const BLOCK_INDEX_BITS: u32 = 9;
 const BLOCK_MASK: u64 = (BLOCK_BITS as u64) - 1;
 const HEADER_LEN: usize = 8 + 4 + 8 + 8 + 4;
-const MAX_HASHES: u32 = 64;
+
+/// Maximum number of hash probes supported by one filter.
+pub const MAX_HASHES: u32 = 64;
+
+/// Maximum serialized size of a filter, including its format header.
+///
+/// The 64 MiB cap bounds memory use for construction, decoding, and
+/// serialization while still supporting filters for tens of millions of keys
+/// at common false-positive targets. Applications may enforce a smaller limit.
+pub const MAX_FILTER_BYTES: usize = 64 * 1024 * 1024;
 
 #[repr(align(64))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +57,67 @@ impl Block {
     }
 }
 
+/// Configuration used to size a Bloom filter for a known key count.
 #[derive(Debug, Clone, Copy)]
 pub struct BloomConfig {
     pub expected_items: usize,
     pub false_positive_rate: f64,
 }
+
+/// A typed failure encountered while validating or building a Bloom filter.
+///
+/// Use this error from fallible constructors and serialization APIs to
+/// distinguish invalid configuration, resource limits, arithmetic overflow,
+/// and allocation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BloomBuildError {
+    ZeroExpectedItems,
+    InvalidFalsePositiveRate,
+    InvalidNumBits,
+    InvalidNumHashes,
+    TooManyHashes {
+        requested: u32,
+        max: u32,
+    },
+    FilterTooLarge {
+        requested_bytes: usize,
+        max_bytes: usize,
+    },
+    SizeOverflow,
+    AllocationFailed,
+}
+
+impl std::fmt::Display for BloomBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroExpectedItems => f.write_str("expected item count must be greater than zero"),
+            Self::InvalidFalsePositiveRate => {
+                f.write_str("false-positive rate must be finite and between zero and one")
+            }
+            Self::InvalidNumBits => f.write_str("Bloom filter bit count must be greater than zero"),
+            Self::InvalidNumHashes => {
+                f.write_str("Bloom filter hash count must be greater than zero")
+            }
+            Self::TooManyHashes { requested, max } => {
+                write!(
+                    f,
+                    "Bloom filter requests {requested} hashes; maximum is {max}"
+                )
+            }
+            Self::FilterTooLarge {
+                requested_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "Bloom filter requires {requested_bytes} bytes; maximum is {max_bytes}"
+            ),
+            Self::SizeOverflow => f.write_str("Bloom filter size calculation overflowed"),
+            Self::AllocationFailed => f.write_str("Bloom filter memory allocation failed"),
+        }
+    }
+}
+
+impl std::error::Error for BloomBuildError {}
 
 #[derive(Debug, Clone, Copy)]
 struct LookupPlan {
@@ -66,39 +132,76 @@ pub struct BloomFilter {
 }
 
 impl BloomFilter {
+    /// Builds a filter from an explicit bit count and hash count.
+    ///
+    /// This convenience API panics for invalid or oversized input. Use
+    /// [`BloomFilter::try_with_num_bits`] when values are untrusted or come
+    /// from configuration.
     pub fn with_num_bits(num_bits: usize, num_hashes: u32) -> Self {
-        assert!(num_bits > 0, "Bloom filter must have at least one bit");
-        assert!(num_hashes > 0, "Bloom filter must use at least one hash");
-        assert!(
-            num_hashes <= MAX_HASHES,
-            "Bloom filter hash count is too large"
-        );
-
-        let num_blocks = num_bits.div_ceil(BLOCK_BITS).max(1);
-
-        Self {
-            blocks: vec![Block::empty(); num_blocks],
-            num_hashes,
-        }
+        Self::try_with_num_bits(num_bits, num_hashes)
+            .expect("valid trusted Bloom filter sizing and available memory")
     }
 
+    /// Fallibly builds a filter from an explicit bit count and hash count.
+    pub fn try_with_num_bits(num_bits: usize, num_hashes: u32) -> Result<Self, BloomBuildError> {
+        if num_bits == 0 {
+            return Err(BloomBuildError::InvalidNumBits);
+        }
+        validate_num_hashes(num_hashes)?;
+
+        let num_blocks = checked_div_ceil(num_bits, BLOCK_BITS)
+            .ok_or(BloomBuildError::SizeOverflow)?
+            .max(1);
+        checked_filter_layout(num_blocks)?;
+
+        allocate_filter(num_blocks, num_hashes)
+    }
+
+    /// Builds a filter sized for the requested expected item count and
+    /// false-positive target.
+    ///
+    /// This convenience API panics for invalid or oversized input. Use
+    /// [`BloomFilter::try_with_false_positive_rate`] for untrusted or
+    /// operator-provided values.
     pub fn with_false_positive_rate(expected_items: usize, false_positive_rate: f64) -> Self {
-        let mut num_bits = optimal_num_bits(expected_items, false_positive_rate);
+        Self::try_with_false_positive_rate(expected_items, false_positive_rate)
+            .expect("valid trusted Bloom filter configuration and available memory")
+    }
+
+    /// Fallibly builds a filter sized for an expected item count and target
+    /// false-positive rate.
+    pub fn try_with_false_positive_rate(
+        expected_items: usize,
+        false_positive_rate: f64,
+    ) -> Result<Self, BloomBuildError> {
+        validate_config(expected_items, false_positive_rate)?;
+
+        let requested_bits = checked_optimal_num_bits(expected_items, false_positive_rate)?;
+        let mut num_blocks = checked_div_ceil(requested_bits, BLOCK_BITS)
+            .ok_or(BloomBuildError::SizeOverflow)?
+            .max(1);
 
         loop {
-            let num_blocks = num_bits.div_ceil(BLOCK_BITS).max(1);
-            let actual_bits = num_blocks * BLOCK_BITS;
-            let num_hashes = optimal_num_hashes(actual_bits, expected_items);
+            let (actual_bits, _, _) = checked_filter_layout(num_blocks)?;
+            let num_hashes = checked_optimal_num_hashes(actual_bits, expected_items)?;
+            validate_num_hashes(num_hashes)?;
 
             let expected_fp =
                 expected_block_false_positive_rate(num_blocks, num_hashes, expected_items);
 
             if expected_fp <= false_positive_rate {
-                return Self::with_num_bits(actual_bits, num_hashes);
+                return allocate_filter(num_blocks, num_hashes);
             }
 
-            num_bits = actual_bits + BLOCK_BITS;
+            num_blocks = num_blocks
+                .checked_add(1)
+                .ok_or(BloomBuildError::SizeOverflow)?;
         }
+    }
+
+    /// Fallibly builds a filter from a configuration object.
+    pub fn try_from_config(config: BloomConfig) -> Result<Self, BloomBuildError> {
+        Self::try_with_false_positive_rate(config.expected_items, config.false_positive_rate)
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -228,13 +331,31 @@ impl BloomFilter {
         self.contains_key(key.as_bytes())
     }
 
+    /// Serializes this filter using the V1 format.
+    ///
+    /// This convenience API panics only if the filter violates the crate's
+    /// internal size invariant or memory allocation fails. Use
+    /// [`BloomFilter::try_to_bytes`] in storage paths that must handle those
+    /// failures explicitly.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.serialized_len());
+        self.try_to_bytes()
+            .expect("valid Bloom filter size and available serialization memory")
+    }
+
+    /// Fallibly serializes this filter using the V1 format.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, BloomBuildError> {
+        let (_, _, serialized_len) = checked_filter_layout(self.num_blocks())?;
+        let num_blocks =
+            u64::try_from(self.num_blocks()).map_err(|_| BloomBuildError::SizeOverflow)?;
+
+        let mut out = Vec::new();
+        out.try_reserve_exact(serialized_len)
+            .map_err(|_| BloomBuildError::AllocationFailed)?;
 
         out.extend_from_slice(&BLOOM_MAGIC);
         out.extend_from_slice(&BLOOM_VERSION.to_le_bytes());
         out.extend_from_slice(&BLOOM_HASH_SEED.to_le_bytes());
-        out.extend_from_slice(&(self.num_blocks() as u64).to_le_bytes());
+        out.extend_from_slice(&num_blocks.to_le_bytes());
         out.extend_from_slice(&self.num_hashes.to_le_bytes());
 
         for block in &self.blocks {
@@ -243,11 +364,18 @@ impl BloomFilter {
             }
         }
 
-        out
+        Ok(out)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BloomDecodeError> {
         let header_len = HEADER_LEN;
+
+        if bytes.len() > MAX_FILTER_BYTES {
+            return Err(BloomDecodeError::FilterTooLarge {
+                requested_bytes: bytes.len(),
+                max_bytes: MAX_FILTER_BYTES,
+            });
+        }
 
         if bytes.len() < header_len {
             return Err(BloomDecodeError::TooShort);
@@ -283,19 +411,28 @@ impl BloomFilter {
         }
 
         let payload_len = num_blocks
-            .checked_mul(BLOCK_WORDS)
-            .and_then(|x| x.checked_mul(8))
+            .checked_mul(BLOCK_BYTES)
             .ok_or(BloomDecodeError::LengthOverflow)?;
 
         let expected_len = HEADER_LEN
             .checked_add(payload_len)
             .ok_or(BloomDecodeError::LengthOverflow)?;
 
+        if expected_len > MAX_FILTER_BYTES {
+            return Err(BloomDecodeError::FilterTooLarge {
+                requested_bytes: expected_len,
+                max_bytes: MAX_FILTER_BYTES,
+            });
+        }
+
         if bytes.len() != expected_len {
             return Err(BloomDecodeError::LengthMismatch);
         }
 
-        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(num_blocks)
+            .map_err(|_| BloomDecodeError::AllocationFailed)?;
         let mut offset = header_len;
 
         for _ in 0..num_blocks {
@@ -312,6 +449,8 @@ impl BloomFilter {
         Ok(Self { blocks, num_hashes })
     }
 
+    /// Builds from a configuration object using the trusted-input convenience
+    /// constructor. Use [`BloomFilter::try_from_config`] for external input.
     pub fn from_config(config: BloomConfig) -> Self {
         Self::with_false_positive_rate(config.expected_items, config.false_positive_rate)
     }
@@ -469,6 +608,136 @@ impl BloomFilter {
     }
 }
 
+fn validate_config(expected_items: usize, false_positive_rate: f64) -> Result<(), BloomBuildError> {
+    if expected_items == 0 {
+        return Err(BloomBuildError::ZeroExpectedItems);
+    }
+
+    if !false_positive_rate.is_finite() || false_positive_rate <= 0.0 || false_positive_rate >= 1.0
+    {
+        return Err(BloomBuildError::InvalidFalsePositiveRate);
+    }
+
+    Ok(())
+}
+
+fn validate_num_hashes(num_hashes: u32) -> Result<(), BloomBuildError> {
+    if num_hashes == 0 {
+        return Err(BloomBuildError::InvalidNumHashes);
+    }
+
+    if num_hashes > MAX_HASHES {
+        return Err(BloomBuildError::TooManyHashes {
+            requested: num_hashes,
+            max: MAX_HASHES,
+        });
+    }
+
+    Ok(())
+}
+
+fn checked_div_ceil(value: usize, divisor: usize) -> Option<usize> {
+    if divisor == 0 {
+        return None;
+    }
+
+    let quotient = value / divisor;
+    let has_remainder = usize::from(value % divisor != 0);
+    quotient.checked_add(has_remainder)
+}
+
+fn checked_round_up(value: usize, alignment: usize) -> Option<usize> {
+    if alignment == 0 {
+        return None;
+    }
+
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Some(value)
+    } else {
+        value.checked_add(alignment - remainder)
+    }
+}
+
+fn checked_optimal_num_bits(
+    expected_items: usize,
+    false_positive_rate: f64,
+) -> Result<usize, BloomBuildError> {
+    validate_config(expected_items, false_positive_rate)?;
+
+    let items = expected_items as f64;
+    let ln_2 = std::f64::consts::LN_2;
+    let raw_bits = -(items * false_positive_rate.ln()) / (ln_2 * ln_2);
+    let rounded_bits = raw_bits.ceil();
+
+    // `usize::MAX as f64` may round upward on 64-bit targets. Rejecting that
+    // boundary conservatively avoids a saturating float-to-integer cast.
+    if !rounded_bits.is_finite() || rounded_bits <= 0.0 || rounded_bits >= usize::MAX as f64 {
+        return Err(BloomBuildError::SizeOverflow);
+    }
+
+    let bits = rounded_bits as usize;
+    checked_round_up(bits, WORD_BITS).ok_or(BloomBuildError::SizeOverflow)
+}
+
+fn checked_optimal_num_hashes(
+    num_bits: usize,
+    expected_items: usize,
+) -> Result<u32, BloomBuildError> {
+    if num_bits == 0 {
+        return Err(BloomBuildError::InvalidNumBits);
+    }
+    if expected_items == 0 {
+        return Err(BloomBuildError::ZeroExpectedItems);
+    }
+
+    let raw_hashes = (num_bits as f64 / expected_items as f64) * std::f64::consts::LN_2;
+    let rounded_hashes = raw_hashes.round();
+    if !rounded_hashes.is_finite() || rounded_hashes > u32::MAX as f64 {
+        return Err(BloomBuildError::SizeOverflow);
+    }
+
+    Ok((rounded_hashes as u32).max(1))
+}
+
+fn checked_filter_layout(num_blocks: usize) -> Result<(usize, usize, usize), BloomBuildError> {
+    if num_blocks == 0 {
+        return Err(BloomBuildError::InvalidNumBits);
+    }
+
+    let actual_bits = num_blocks
+        .checked_mul(BLOCK_BITS)
+        .ok_or(BloomBuildError::SizeOverflow)?;
+    let payload_bytes = num_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or(BloomBuildError::SizeOverflow)?;
+    let serialized_bytes = HEADER_LEN
+        .checked_add(payload_bytes)
+        .ok_or(BloomBuildError::SizeOverflow)?;
+
+    if serialized_bytes > MAX_FILTER_BYTES {
+        return Err(BloomBuildError::FilterTooLarge {
+            requested_bytes: serialized_bytes,
+            max_bytes: MAX_FILTER_BYTES,
+        });
+    }
+
+    Ok((actual_bits, payload_bytes, serialized_bytes))
+}
+
+fn allocate_filter(num_blocks: usize, num_hashes: u32) -> Result<BloomFilter, BloomBuildError> {
+    let (_, _, _) = checked_filter_layout(num_blocks)?;
+    validate_num_hashes(num_hashes)?;
+
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(num_blocks)
+        .map_err(|_| BloomBuildError::AllocationFailed)?;
+    blocks.resize(num_blocks, Block::empty());
+
+    Ok(BloomFilter { blocks, num_hashes })
+}
+
 fn block_bit_indexes(bit_hash: u64, num_hashes: u32) -> impl Iterator<Item = usize> {
     let mut state = bit_hash;
     let mut pool = state;
@@ -534,36 +803,28 @@ fn mix64(mut x: u64) -> u64 {
     x
 }
 
+/// Returns the conventional Bloom bit-count estimate for trusted inputs.
+///
+/// # Panics
+///
+/// Panics if `expected_items` is zero, the false-positive rate is invalid, or
+/// the resulting size cannot be represented. Use the fallible filter
+/// constructors for configuration and operator-provided values.
 pub fn optimal_num_bits(expected_items: usize, false_positive_rate: f64) -> usize {
-    assert!(expected_items > 0, "expected_items must be greater than 0");
-
-    assert!(
-        false_positive_rate > 0.0 && false_positive_rate < 1.0,
-        "false_positive_rate must be between 0 and 1"
-    );
-
-    let n = expected_items as f64;
-    let p = false_positive_rate;
-
-    let ln_2 = std::f64::consts::LN_2;
-
-    let raw_bits = -(n * p.ln()) / (ln_2 * ln_2);
-    let bits = raw_bits.ceil() as usize;
-
-    bits.div_ceil(64) * 64
+    checked_optimal_num_bits(expected_items, false_positive_rate)
+        .expect("valid trusted Bloom sizing inputs and representable bit count")
 }
 
+/// Returns the conventional Bloom hash-count estimate for trusted inputs.
+///
+/// # Panics
+///
+/// Panics if either input is zero or the calculated count cannot be
+/// represented as `u32`. The returned mathematical optimum may exceed
+/// [`MAX_HASHES`], in which case a filter constructor rejects it.
 pub fn optimal_num_hashes(num_bits: usize, expected_items: usize) -> u32 {
-    assert!(num_bits > 0, "num_bits must be greater than 0");
-    assert!(expected_items > 0, "expected_items must be greater than 0");
-
-    let m = num_bits as f64;
-    let n = expected_items as f64;
-
-    let raw_hashes = (m / n) * std::f64::consts::LN_2;
-    let hashes = raw_hashes.round() as u32;
-
-    hashes.max(1)
+    checked_optimal_num_hashes(num_bits, expected_items)
+        .expect("valid trusted Bloom sizing inputs and representable hash count")
 }
 
 #[inline(always)]
@@ -573,6 +834,11 @@ fn index(num_bits: usize, hash: u64) -> usize {
     ((hash as u128 * num_bits as u128) >> 64) as usize
 }
 
+/// Estimates bit density for trusted, nonzero filter sizing inputs.
+///
+/// # Panics
+///
+/// Panics if `num_bits` or `num_hashes` is zero.
 pub fn expected_density(num_bits: usize, num_hashes: u32, inserted_items: usize) -> f64 {
     assert!(num_bits > 0, "num_bits must be greater than 0");
     assert!(num_hashes > 0, "num_hashes must be greater than 0");
@@ -584,16 +850,33 @@ pub fn expected_density(num_bits: usize, num_hashes: u32, inserted_items: usize)
     1.0 - (-(k * n) / m).exp()
 }
 
+/// Estimates the conventional Bloom false-positive rate for trusted inputs.
+///
+/// # Panics
+///
+/// Panics if `num_bits` or `num_hashes` is zero, or if the hash count exceeds
+/// [`MAX_HASHES`].
 pub fn expected_false_positive_rate(
     num_bits: usize,
     num_hashes: u32,
     inserted_items: usize,
 ) -> f64 {
+    assert!(
+        num_hashes <= MAX_HASHES,
+        "Bloom filter hash count is too large"
+    );
+
     let density = expected_density(num_bits, num_hashes, inserted_items);
 
     density.powi(num_hashes as i32)
 }
 
+/// Estimates the block-filter false-positive rate for trusted sizing inputs.
+///
+/// # Panics
+///
+/// Panics if `num_blocks` or `num_hashes` is zero, or if the hash count is
+/// greater than [`MAX_HASHES`].
 pub fn expected_block_false_positive_rate(
     num_blocks: usize,
     num_hashes: u32,
@@ -601,6 +884,10 @@ pub fn expected_block_false_positive_rate(
 ) -> f64 {
     assert!(num_blocks > 0, "num_blocks must be greater than 0");
     assert!(num_hashes > 0, "num_hashes must be greater than 0");
+    assert!(
+        num_hashes <= MAX_HASHES,
+        "Bloom filter hash count is too large"
+    );
 
     let lambda = inserted_items as f64 / num_blocks as f64;
     let hashes = num_hashes as usize;
@@ -637,6 +924,7 @@ fn binomial(n: usize, k: usize) -> f64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A typed failure encountered while decoding serialized Bloom filter bytes.
 pub enum BloomDecodeError {
     TooShort,
     BadMagic,
@@ -646,7 +934,54 @@ pub enum BloomDecodeError {
     InvalidNumHashes,
     LengthMismatch,
     LengthOverflow,
+    FilterTooLarge {
+        requested_bytes: usize,
+        max_bytes: usize,
+    },
+    AllocationFailed,
 }
+
+impl std::fmt::Display for BloomDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => f.write_str("serialized Bloom filter is shorter than its header"),
+            Self::BadMagic => f.write_str("serialized Bloom filter has invalid magic bytes"),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported Bloom filter format version {version}")
+            }
+            Self::WrongHashSeed(seed) => {
+                write!(
+                    f,
+                    "serialized Bloom filter uses unsupported hash seed {seed}"
+                )
+            }
+            Self::InvalidNumBlocks => {
+                f.write_str("serialized Bloom filter has an invalid block count")
+            }
+            Self::InvalidNumHashes => {
+                f.write_str("serialized Bloom filter has an invalid hash count")
+            }
+            Self::LengthMismatch => {
+                f.write_str("serialized Bloom filter length does not match its header")
+            }
+            Self::LengthOverflow => {
+                f.write_str("serialized Bloom filter length calculation overflowed")
+            }
+            Self::FilterTooLarge {
+                requested_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "serialized Bloom filter requires {requested_bytes} bytes; maximum is {max_bytes}"
+            ),
+            Self::AllocationFailed => {
+                f.write_str("memory allocation failed while decoding Bloom filter")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BloomDecodeError {}
 
 #[cfg(test)]
 mod tests {
@@ -935,5 +1270,115 @@ mod tests {
         let err = BloomFilter::from_bytes(&bytes).unwrap_err();
 
         assert_eq!(err, BloomDecodeError::LengthMismatch);
+    }
+
+    #[test]
+    fn fallible_config_rejects_invalid_item_counts_and_false_positive_rates() {
+        assert_eq!(
+            BloomFilter::try_from_config(BloomConfig {
+                expected_items: 0,
+                false_positive_rate: 0.01,
+            }),
+            Err(BloomBuildError::ZeroExpectedItems)
+        );
+
+        for false_positive_rate in [
+            0.0,
+            1.0,
+            -0.01,
+            1.01,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                BloomFilter::try_from_config(BloomConfig {
+                    expected_items: 100,
+                    false_positive_rate,
+                }),
+                Err(BloomBuildError::InvalidFalsePositiveRate)
+            );
+        }
+    }
+
+    #[test]
+    fn fallible_bit_builder_rejects_invalid_hash_counts_and_oversized_filters() {
+        assert_eq!(
+            BloomFilter::try_with_num_bits(0, 1),
+            Err(BloomBuildError::InvalidNumBits)
+        );
+        assert_eq!(
+            BloomFilter::try_with_num_bits(512, 0),
+            Err(BloomBuildError::InvalidNumHashes)
+        );
+        assert_eq!(
+            BloomFilter::try_with_num_bits(512, MAX_HASHES + 1),
+            Err(BloomBuildError::TooManyHashes {
+                requested: MAX_HASHES + 1,
+                max: MAX_HASHES,
+            })
+        );
+
+        let oversized_bits = MAX_FILTER_BYTES * 8;
+        assert!(matches!(
+            BloomFilter::try_with_num_bits(oversized_bits, 1),
+            Err(BloomBuildError::FilterTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn fallible_sizing_rejects_unrepresentable_requests() {
+        let result = BloomFilter::try_with_false_positive_rate(usize::MAX, f64::from_bits(1));
+
+        assert_eq!(result, Err(BloomBuildError::SizeOverflow));
+    }
+
+    #[test]
+    fn fallible_config_builds_a_filter_that_survives_fallible_serialization() {
+        let mut filter = BloomFilter::try_from_config(BloomConfig {
+            expected_items: 128,
+            false_positive_rate: 0.01,
+        })
+        .unwrap();
+        filter.insert_key(b"configured-storage-key");
+
+        let bytes = filter.try_to_bytes().unwrap();
+        let decoded = BloomFilter::from_bytes(&bytes).unwrap();
+
+        assert!(decoded.may_contain_key(b"configured-storage-key"));
+    }
+
+    #[test]
+    fn fallible_serialization_matches_the_existing_v1_bytes() {
+        let mut filter = BloomFilter::with_num_bits(1024, 3);
+        filter.insert_key(b"slice-one-serialization");
+
+        assert_eq!(filter.try_to_bytes().unwrap(), filter.to_bytes());
+    }
+
+    #[test]
+    fn decode_rejects_a_declared_filter_over_the_hard_limit() {
+        let mut bytes = vec![0; HEADER_LEN];
+        bytes[0..8].copy_from_slice(&BLOOM_MAGIC);
+        bytes[8..12].copy_from_slice(&BLOOM_VERSION.to_le_bytes());
+        bytes[12..20].copy_from_slice(&BLOOM_HASH_SEED.to_le_bytes());
+
+        let max_blocks = (MAX_FILTER_BYTES - HEADER_LEN) / (BLOCK_WORDS * 8);
+        let declared_blocks = max_blocks + 1;
+        bytes[20..28].copy_from_slice(&(declared_blocks as u64).to_le_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
+
+        assert!(matches!(
+            BloomFilter::from_bytes(&bytes),
+            Err(BloomDecodeError::FilterTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn public_build_and_decode_errors_implement_standard_error_traits() {
+        fn assert_error<E: std::error::Error + Send + Sync + 'static>() {}
+
+        assert_error::<BloomBuildError>();
+        assert_error::<BloomDecodeError>();
     }
 }
