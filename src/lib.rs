@@ -22,6 +22,27 @@ pub const MAX_HASHES: u32 = 64;
 /// at common false-positive targets. Applications may enforce a smaller limit.
 pub const MAX_FILTER_BYTES: usize = 64 * 1024 * 1024;
 
+/// Stable compatibility identity for the serialized Bloom encoding.
+///
+/// This descriptor identifies the format version and hash seed needed by
+/// storage metadata. It intentionally does not expose the private block
+/// layout, probing implementation, or caller-specific key transformation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomFormatDescriptor {
+    /// Version of the serialized Bloom filter encoding.
+    pub format_version: u32,
+    /// Seed used by the stable key hashing contract.
+    pub hash_seed: u64,
+}
+
+/// Returns the stable compatibility identity emitted in the V1 header.
+pub const fn format_descriptor() -> BloomFormatDescriptor {
+    BloomFormatDescriptor {
+        format_version: BLOOM_VERSION,
+        hash_seed: BLOOM_HASH_SEED,
+    }
+}
+
 #[repr(align(64))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Block {
@@ -347,14 +368,15 @@ impl BloomFilter {
         let (_, _, serialized_len) = checked_filter_layout(self.num_blocks())?;
         let num_blocks =
             u64::try_from(self.num_blocks()).map_err(|_| BloomBuildError::SizeOverflow)?;
+        let descriptor = format_descriptor();
 
         let mut out = Vec::new();
         out.try_reserve_exact(serialized_len)
             .map_err(|_| BloomBuildError::AllocationFailed)?;
 
         out.extend_from_slice(&BLOOM_MAGIC);
-        out.extend_from_slice(&BLOOM_VERSION.to_le_bytes());
-        out.extend_from_slice(&BLOOM_HASH_SEED.to_le_bytes());
+        out.extend_from_slice(&descriptor.format_version.to_le_bytes());
+        out.extend_from_slice(&descriptor.hash_seed.to_le_bytes());
         out.extend_from_slice(&num_blocks.to_le_bytes());
         out.extend_from_slice(&self.num_hashes.to_le_bytes());
 
@@ -369,6 +391,7 @@ impl BloomFilter {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BloomDecodeError> {
         let header_len = HEADER_LEN;
+        let descriptor = format_descriptor();
 
         if bytes.len() > MAX_FILTER_BYTES {
             return Err(BloomDecodeError::FilterTooLarge {
@@ -386,12 +409,12 @@ impl BloomFilter {
         }
 
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if version != BLOOM_VERSION {
+        if version != descriptor.format_version {
             return Err(BloomDecodeError::UnsupportedVersion(version));
         }
 
         let seed = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-        if seed != BLOOM_HASH_SEED {
+        if seed != descriptor.hash_seed {
             return Err(BloomDecodeError::WrongHashSeed(seed));
         }
 
@@ -987,6 +1010,24 @@ impl std::error::Error for BloomDecodeError {}
 mod tests {
     use super::*;
 
+    // Frozen V1 bytes for a one-block filter containing `alpha` and `beta`.
+    // Keep this fixture independent from runtime serialization so encoder and
+    // decoder changes cannot silently redefine the compatibility baseline.
+    const V1_GOLDEN_BYTES: [u8; 96] = [
+        // Magic, version, hash seed, block count, and hash count.
+        b'B', b'L', b'M', b'F', b'I', b'L', b'T', b'1', 1, 0, 0, 0, 0x37, 0x1a, 0x4b, 0x2c, 0x9a,
+        0xfd, 0xe8, 0xd6, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0,
+        // Eight little-endian words in the V1 block payload.
+        0, 0, 0, 0, 0, 0, 0, 0, // word 0
+        0, 0, 0, 0, 32, 0, 0, 0, // word 1
+        0, 0, 0, 0, 0, 0, 0, 0, // word 2
+        0, 0, 0, 0, 0, 64, 32, 0, // word 3
+        0, 0, 0, 0, 0, 0, 0, 0, // word 4
+        0, 0, 8, 0, 0, 0, 0, 0, // word 5
+        0, 0, 0, 0, 0, 0, 0, 0, // word 6
+        0, 0, 32, 0, 0, 0, 1, 0, // word 7
+    ];
+
     #[test]
     fn block_filter_rounds_up_to_full_blocks() {
         let one_bit = BloomFilter::with_num_bits(1, 3);
@@ -1380,5 +1421,48 @@ mod tests {
 
         assert_error::<BloomBuildError>();
         assert_error::<BloomDecodeError>();
+    }
+
+    #[test]
+    fn public_format_descriptor_matches_v1_serialized_header() {
+        let descriptor = format_descriptor();
+        let filter = BloomFilter::try_with_num_bits(512, 3).unwrap();
+        let bytes = filter.try_to_bytes().unwrap();
+
+        assert_eq!(
+            descriptor.format_version,
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+        );
+        assert_eq!(
+            descriptor.hash_seed,
+            u64::from_le_bytes(bytes[12..20].try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn v1_encoder_matches_frozen_golden_bytes() {
+        let mut filter = BloomFilter::try_with_num_bits(512, 3).unwrap();
+        filter.insert_key(b"alpha");
+        filter.insert_key(b"beta");
+
+        assert_eq!(filter.try_to_bytes().unwrap(), V1_GOLDEN_BYTES);
+    }
+
+    #[test]
+    fn v1_golden_fixture_decodes_without_false_negatives() {
+        let descriptor = format_descriptor();
+        assert_eq!(
+            u32::from_le_bytes(V1_GOLDEN_BYTES[8..12].try_into().unwrap()),
+            descriptor.format_version
+        );
+        assert_eq!(
+            u64::from_le_bytes(V1_GOLDEN_BYTES[12..20].try_into().unwrap()),
+            descriptor.hash_seed
+        );
+
+        let decoded = BloomFilter::from_bytes(&V1_GOLDEN_BYTES).unwrap();
+
+        assert!(decoded.may_contain_key(b"alpha"));
+        assert!(decoded.may_contain_key(b"beta"));
     }
 }
