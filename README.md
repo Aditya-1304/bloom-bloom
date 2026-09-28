@@ -368,10 +368,13 @@ flowchart TD
 Hardware prefetch is behind a feature flag:
 
 ```bash
-cargo run --release --features prefetch
+cargo run --release --features "demo-rayon prefetch"
 ```
 
-Without the feature, the batch method still works and the prefetch call compiles to a no-op.
+The standalone throughput demo uses Rayon and is excluded from default builds.
+Enable it with `demo-rayon`; hardware prefetch remains an independent choice.
+Without `prefetch`, the batch method still works and the hardware-prefetch call
+compiles to a no-op.
 
 ### Serialization
 
@@ -445,19 +448,19 @@ cargo test
 Run the benchmark/demo binary with the default `1_000_000` item workload:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release
+RUSTFLAGS="-C target-cpu=native" cargo run --release --features demo-rayon
 ```
 
 Run with a larger workload:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release -- 5000000
+RUSTFLAGS="-C target-cpu=native" cargo run --release --features demo-rayon -- 5000000
 ```
 
 Run with hardware prefetch enabled:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release --features prefetch -- 5000000
+RUSTFLAGS="-C target-cpu=native" cargo run --release --features "demo-rayon prefetch" -- 5000000
 ```
 
 The demo:
@@ -489,7 +492,7 @@ Single-key lookup and batch throughput measure different things. Batch numbers c
 Example run on a 5,000,000-key workload:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release --features prefetch -- 5000000
+RUSTFLAGS="-C target-cpu=native" cargo run --release --features "demo-rayon prefetch" -- 5000000
 ```
 
 Configuration:
@@ -588,13 +591,13 @@ cargo test
 Run release demo:
 
 ```bash
-cargo run --release
+cargo run --release --features demo-rayon
 ```
 
 Run release demo with prefetch:
 
 ```bash
-cargo run --release --features prefetch
+cargo run --release --features "demo-rayon prefetch"
 ```
 
 ## Summary
