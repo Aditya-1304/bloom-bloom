@@ -1416,6 +1416,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_a_declared_payload_length_that_overflows() {
+        let descriptor = format_descriptor();
+        let mut bytes = vec![0; HEADER_LEN];
+        bytes[0..8].copy_from_slice(&BLOOM_MAGIC);
+        bytes[8..12].copy_from_slice(&descriptor.format_version.to_le_bytes());
+        bytes[12..20].copy_from_slice(&descriptor.hash_seed.to_le_bytes());
+        bytes[20..28].copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
+
+        assert_eq!(
+            BloomFilter::from_bytes(&bytes),
+            Err(BloomDecodeError::LengthOverflow)
+        );
+    }
+
+    #[test]
     fn public_build_and_decode_errors_implement_standard_error_traits() {
         fn assert_error<E: std::error::Error + Send + Sync + 'static>() {}
 

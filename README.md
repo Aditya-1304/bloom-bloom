@@ -294,6 +294,17 @@ let config = BloomConfig {
 let filter = BloomFilter::from_config(config);
 ```
 
+### Known-count construction and builder status
+
+Bloom filters are sized at construction from the caller-provided
+`expected_items`, which should be an exact item count or a safe upper bound.
+The filter does not count inserted keys or resize itself as keys are added.
+
+No bounded finalize-time builder is provided for the current V1 known-count
+path. Reconsider one only if a later compaction design cannot obtain an exact
+count or safe upper bound economically, and measurements show that pre-counting
+materially harms that compaction path.
+
 ### Inserting Keys
 
 ```rust
