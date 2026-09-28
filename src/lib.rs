@@ -1028,6 +1028,29 @@ mod tests {
         0, 0, 32, 0, 0, 0, 1, 0, // word 7
     ];
 
+    // These checked-in byte fixtures freeze the multi-block V1 interpretations
+    // for the unrolled seven-probe path and the remixed eight-probe path.
+    const V1_MULTIBLOCK_7_HASHES_HEX: &str =
+        include_str!("../tests/fixtures/v1_multiblock_7_hashes.hex");
+    const V1_MULTIBLOCK_8_HASHES_HEX: &str =
+        include_str!("../tests/fixtures/v1_multiblock_8_hashes.hex");
+
+    fn decode_hex_fixture(contents: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        for line in contents.lines() {
+            let line = line.trim();
+            assert_eq!(line.len() % 2, 0, "fixture line has an incomplete byte");
+
+            for pair in line.as_bytes().chunks_exact(2) {
+                let pair = std::str::from_utf8(pair).expect("fixture data is ASCII");
+                bytes.push(u8::from_str_radix(pair, 16).expect("fixture data is hexadecimal"));
+            }
+        }
+
+        bytes
+    }
+
     #[test]
     fn block_filter_rounds_up_to_full_blocks() {
         let one_bit = BloomFilter::with_num_bits(1, 3);
@@ -1480,5 +1503,64 @@ mod tests {
 
         assert!(decoded.may_contain_key(b"alpha"));
         assert!(decoded.may_contain_key(b"beta"));
+    }
+
+    #[test]
+    fn v1_multiblock_seven_probe_fixture_freezes_selection_and_probes() {
+        let keys: [&[u8]; 4] = [
+            b"v1-multiblock-seven-alpha",
+            b"v1-multiblock-seven-beta",
+            b"v1-multiblock-seven-gamma",
+            b"v1-multiblock-seven-delta",
+        ];
+        let mut filter = BloomFilter::try_with_num_bits(8 * BLOCK_BITS, 7).unwrap();
+        for key in &keys {
+            filter.insert_key(key);
+        }
+
+        assert_eq!(filter.num_blocks(), 8);
+        assert_eq!(filter.num_hashes(), 7);
+        assert!(
+            keys.iter()
+                .any(|key| filter.lookup_plan(key).block_index != 0),
+            "fixture must exercise a non-zero block index"
+        );
+
+        let fixture = decode_hex_fixture(V1_MULTIBLOCK_7_HASHES_HEX);
+        assert_eq!(filter.try_to_bytes().unwrap(), fixture);
+
+        let decoded = BloomFilter::from_bytes(&fixture).unwrap();
+        assert_eq!(decoded.num_blocks(), 8);
+        assert_eq!(decoded.num_hashes(), 7);
+        for key in &keys {
+            assert!(decoded.may_contain_key(key));
+        }
+    }
+
+    #[test]
+    fn v1_multiblock_eight_probe_fixture_freezes_remix_behavior() {
+        let keys: [&[u8]; 4] = [
+            b"v1-remix-eight-alpha",
+            b"v1-remix-eight-beta",
+            b"v1-remix-eight-gamma",
+            b"v1-remix-eight-delta",
+        ];
+        let mut filter = BloomFilter::try_with_num_bits(2 * BLOCK_BITS, 8).unwrap();
+        for key in &keys {
+            filter.insert_key(key);
+        }
+
+        assert_eq!(filter.num_blocks(), 2);
+        assert_eq!(filter.num_hashes(), 8);
+
+        let fixture = decode_hex_fixture(V1_MULTIBLOCK_8_HASHES_HEX);
+        assert_eq!(filter.try_to_bytes().unwrap(), fixture);
+
+        let decoded = BloomFilter::from_bytes(&fixture).unwrap();
+        assert_eq!(decoded.num_blocks(), 2);
+        assert_eq!(decoded.num_hashes(), 8);
+        for key in &keys {
+            assert!(decoded.may_contain_key(key));
+        }
     }
 }
