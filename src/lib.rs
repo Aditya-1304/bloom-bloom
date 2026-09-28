@@ -245,6 +245,10 @@ impl BloomFilter {
         expected_block_false_positive_rate(self.num_blocks(), self.num_hashes(), inserted_items)
     }
 
+    /// Adds a byte key while this filter is exclusively borrowed.
+    ///
+    /// Insert all keys during private construction, before publishing the
+    /// completed filter for shared immutable reads.
     pub fn insert_key(&mut self, key: &[u8]) -> bool {
         let hash = xxh3_128_with_seed(key, BLOOM_HASH_SEED);
 
@@ -478,6 +482,11 @@ impl BloomFilter {
         Self::with_false_positive_rate(config.expected_items, config.false_positive_rate)
     }
 
+    /// Returns whether `key` may be present in this filter.
+    ///
+    /// A `false` result means the key is definitely absent; `true` permits a
+    /// false positive. The shared borrow supports immutable reads after
+    /// publication.
     pub fn may_contain_key(&self, key: &[u8]) -> bool {
         self.contains_key(key)
     }
@@ -486,6 +495,10 @@ impl BloomFilter {
         self.contains_str(key)
     }
 
+    /// Clears all filter bits while the caller has exclusive mutable access.
+    ///
+    /// Use this only while privately owning the filter or when it has been
+    /// withdrawn from readers. Published filters should remain immutable.
     pub fn clear(&mut self) {
         for block in &mut self.blocks {
             block.words.fill(0);

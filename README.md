@@ -1,6 +1,6 @@
 # Bloom Bloom
 
-Bloom Bloom is a compact Rust implementation of a deterministic, cache-conscious block Bloom filter.
+Bloom Bloom is a standalone, storage-independent Rust implementation of a deterministic, cache-conscious block Bloom filter.
 
 It answers one question quickly:
 
@@ -15,7 +15,7 @@ This makes Bloom Bloom useful as a fast pre-check before expensive exact work, s
 
 ## Current Design
 
-Bloom Bloom started as a conventional Bloom filter with generic `T: Hash` values, a packed `Vec<u64>` bit vector, and an atomic variant for concurrent mutation. The current implementation has been redesigned around storage-engine use cases:
+Bloom Bloom started as a conventional Bloom filter with generic `T: Hash` values, a packed `Vec<u64>` bit vector, and an atomic variant for concurrent mutation. The current implementation provides deterministic byte-key mechanics that can be used by storage engines and other applications:
 
 - deterministic byte-key API: `&[u8]`
 - `xxh3_128_with_seed` hashing
@@ -29,25 +29,24 @@ Bloom Bloom started as a conventional Bloom filter with generic `T: Hash` values
 - optional x86_64 software prefetch
 - branchless batch lookup path for missing-heavy workloads
 
-The core type is now:
+`BloomFilter` keeps its representation private. Callers use its construction,
+insertion, membership, serialization, decoding, and optional batch-lookup APIs.
 
-```rust
-pub struct BloomFilter {
-    blocks: Vec<Block>,
-    num_hashes: u32,
-}
+The intended lifecycle is:
+
+```mermaid
+flowchart LR
+    A["Private mutable BloomFilter"] --> B["Insert keys"]
+    B --> C["Serialize and publish"]
+    C --> D["Immutable BloomFilter"]
+    D --> E["Shared read-only readers"]
 ```
 
-There is no production `AtomicBloomFilter` in the current design. For SSTables and similar immutable structures, the expected lifecycle is:
-
-```text
-build with &mut BloomFilter
-serialize to disk
-load later
-share read-only through &BloomFilter
-```
-
-Immutable reads are already thread-safe in Rust as long as callers share `&BloomFilter` or `Arc<BloomFilter>`.
+Construction and reset operations require exclusive `&mut BloomFilter` access.
+After publication, callers share only immutable `&BloomFilter` references (or
+`Arc<BloomFilter>`). The crate does not expose atomic or shared mutation APIs.
+`clear(&mut self)` remains available when the caller again has exclusive access;
+it must not be used while the filter is published to readers.
 
 ## Architecture
 
@@ -408,34 +407,17 @@ Free helper functions are also exposed:
 - `expected_false_positive_rate`
 - `expected_block_false_positive_rate`
 
-## LSM / SSTable Usage
+## Storage-Independent Integration Boundary
 
-Bloom Bloom is especially suited for immutable table filters.
+Bloom Bloom operates only on the byte keys supplied by its caller. It does not
+interpret application or database key formats, choose which logical identities
+to include, or decide when a filter is eligible for a lookup. The integration
+must apply the same key transformation before insertion and lookup.
 
-```mermaid
-sequenceDiagram
-    participant Mem as MemTable Flush
-    participant BF as BloomFilter
-    participant SST as SSTable File
-    participant Read as Reader
-
-    Mem->>BF: insert_key(user_key)
-    Mem->>BF: insert_key(tombstone_key)
-    BF->>SST: to_bytes()
-    SST-->>Read: load metadata
-    Read->>BF: from_bytes()
-    Read->>BF: may_contain_key(user_key)
-    BF-->>Read: false -> skip SSTable
-    BF-->>Read: true -> check table index/data blocks
-```
-
-Important storage-engine notes:
-
-- Hash the user key, not an internal key with a timestamp, unless your lookup path can reproduce that exact internal key.
-- Insert tombstone keys into the filter. A tombstone is still an entry for that key.
-- Build the filter completely before publishing the SSTable.
-- Share the loaded filter immutably between readers.
-- Keep `BLOOM_HASH_SEED` and the serialized format stable across database versions.
+The calling application owns key normalization and deduplication, persisted
+metadata and integrity checks, cache policy, exact-lookup fallback, query
+eligibility, delete semantics, and metrics. These responsibilities remain
+outside this independently usable crate.
 
 ## Running The Project
 
