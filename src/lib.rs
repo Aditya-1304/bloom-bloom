@@ -605,7 +605,7 @@ impl BloomFilter {
             }; BATCH_SIZE];
 
             for (i, key) in chunk.iter().enumerate() {
-                let plan = self.lookup_plan(*key);
+                let plan = self.lookup_plan(key);
                 self.prefetch_block(plan.block_index);
                 plans[i] = plan;
             }
@@ -630,7 +630,7 @@ impl BloomFilter {
             }; BATCH_SIZE];
 
             for (i, key) in chunk.iter().enumerate() {
-                let plan = self.lookup_plan(*key);
+                let plan = self.lookup_plan(key);
                 self.prefetch_block(plan.block_index);
                 plans[i] = plan;
             }
@@ -678,7 +678,7 @@ fn checked_div_ceil(value: usize, divisor: usize) -> Option<usize> {
     }
 
     let quotient = value / divisor;
-    let has_remainder = usize::from(value % divisor != 0);
+    let has_remainder = usize::from(!value.is_multiple_of(divisor));
     quotient.checked_add(has_remainder)
 }
 
@@ -1055,7 +1055,7 @@ mod tests {
             let line = line.trim();
             assert_eq!(line.len() % 2, 0, "fixture line has an incomplete byte");
 
-            for pair in line.as_bytes().chunks_exact(2) {
+            for pair in line.as_bytes().as_chunks::<2>().0 {
                 let pair = std::str::from_utf8(pair).expect("fixture data is ASCII");
                 bytes.push(u8::from_str_radix(pair, 16).expect("fixture data is hexadecimal"));
             }

@@ -23,7 +23,7 @@ Bloom Bloom started as a conventional Bloom filter with generic `T: Hash` values
 - 512-bit block layout with 64-byte alignment
 - one block access per key
 - block-aware false-positive-rate sizing
-- manual serialization and checked deserialization
+- fallible serialization and checked deserialization
 - normal single-key lookup API
 - batch count APIs
 - optional x86_64 software prefetch
@@ -55,7 +55,7 @@ flowchart TD
     A[Caller] --> B{Public API}
     B --> C[insert_key / may_contain_key]
     B --> D[batch count APIs]
-    B --> E[to_bytes / from_bytes]
+    B --> E[try_to_bytes / from_bytes]
 
     C --> F[XXH3 128-bit hash]
     D --> F
@@ -238,7 +238,7 @@ offset  size  field
 
 ```mermaid
 flowchart LR
-    A[to_bytes] --> B[magic]
+    A[try_to_bytes] --> B[magic]
     B --> C[version]
     C --> D[hash seed]
     D --> E[num blocks]
@@ -262,36 +262,121 @@ Deserialization checks:
 - payload length arithmetic does not overflow
 - byte length matches exactly
 
-This makes the format suitable for SSTable metadata blocks and other persisted storage.
+`from_bytes` performs owned decoding. Borrowed or zero-copy decoding is
+**DEFERRED — REQUIRES RAGNORDB ALLOCATION/CACHE PROFILING**. Reconsider it only
+if RagnorDB measurements show a meaningful cost from filter decode allocation,
+filter-cache admission copying, reopen/startup decoding, or point-read cache
+behavior. Any future borrowed decoder must preserve length and format
+validation, alignment and lifetime safety, the hard size limit, and V1
+semantics.
+
+## V1 Compatibility Contract
+
+The public compatibility identity is available without exposing the private
+block representation:
+
+```rust
+let descriptor = bloom_bloom::format_descriptor();
+
+println!("{}", descriptor.format_version);
+println!("{}", descriptor.hash_seed);
+```
+
+V1 compatibility covers serialized format version `1`, hash seed
+`0xD6E8_FD9A_2C4B_1A37`, and the serialized byte encoding. The checked-in
+golden fixtures freeze representative V1 lookup interpretations as well as the
+bytes:
+
+| Fixture | Shape | Compatibility behavior frozen |
+| --- | --- | --- |
+| `V1_GOLDEN_BYTES` in `src/lib.rs` tests | One block, 3 hashes | V1 header and the fewer-than-seven-probe path |
+| `tests/fixtures/v1_multiblock_7_hashes.hex` | Eight blocks, 7 hashes | Multi-block selection and the manually unrolled seven-probe path |
+| `tests/fixtures/v1_multiblock_8_hashes.hex` | Two blocks, 8 hashes | Multi-block selection and the remixed greater-than-seven-probe path |
+
+Each fixture is independent of runtime serialization. Tests require the current
+encoder to reproduce its exact bytes, then decode those bytes and verify that
+all fixture keys remain possible members. These fixtures characterize the V1
+hash seed use, low/high 64-bit hash roles, block-index mapping, probe
+interpretation, and little-endian encoding. They do not promise that private
+implementation details are stable.
+
+The following are not public compatibility surface: `Block`, its alignment,
+the internal `Vec` representation, or application-specific key transformations.
+Storage engines own their key identity and must use the same transformation
+when building and querying a filter.
+
+This explicit format can be persisted by storage engines and other callers;
+the caller remains responsible for its surrounding metadata and integrity
+checks.
 
 ## Public API
 
-### Constructing A Filter
+### Fallible Construction
 
 ```rust
 use bloom_bloom::BloomFilter;
 
-let mut filter = BloomFilter::with_false_positive_rate(100_000, 0.01);
+let expected_items = 100_000;
+let mut filter =
+    BloomFilter::try_with_false_positive_rate(expected_items, 0.01)?;
+
+filter.insert_key(b"example-key");
+
+let bytes = filter.try_to_bytes()?;
+let loaded = BloomFilter::from_bytes(&bytes)?;
 ```
 
-Or use explicit sizing:
+The example assumes it is inside a function that returns a compatible `Result`.
+For storage-engine use, prefer the fallible constructors and serializer so
+invalid sizing, configured limits, arithmetic overflow, and allocation failure
+can be handled as errors. `expected_items` must be an exact count or a safe
+upper bound supplied by the caller; Bloom Bloom does not count keys or resize
+the filter as they are inserted.
 
-```rust
-let filter = BloomFilter::with_num_bits(1_048_576, 7);
-```
-
-Or a config object:
+Fallible configuration and raw-bit construction are also available:
 
 ```rust
 use bloom_bloom::{BloomConfig, BloomFilter};
 
-let config = BloomConfig {
+let configured = BloomFilter::try_from_config(BloomConfig {
     expected_items: 100_000,
     false_positive_rate: 0.01,
-};
+})?;
 
-let filter = BloomFilter::from_config(config);
+let explicitly_sized = BloomFilter::try_with_num_bits(1_048_576, 7)?;
 ```
+
+The infallible `with_false_positive_rate`, `with_num_bits`, `from_config`, and
+`to_bytes` APIs are convenience wrappers for trusted inputs. They may panic if
+the supplied configuration is invalid, exceeds the limit, or allocation
+fails. Use the fallible APIs for untrusted, operator-provided, persisted, or
+storage-engine sizing.
+
+### Limits And Errors
+
+The crate enforces these construction and decode limits before allocation:
+
+| Limit or validation | Contract |
+| --- | --- |
+| Expected item count | Must be greater than zero |
+| False-positive rate | Must be finite and strictly between zero and one; NaN and infinities are rejected |
+| Raw bit count | Must be greater than zero |
+| Hash count | Must be between 1 and `MAX_HASHES` (64) |
+| Serialized filter size | At most `MAX_FILTER_BYTES` (64 MiB, including the header) |
+| Allocation | Fallible APIs return a typed allocation error |
+| Size calculations | Checked; overflow returns a typed error |
+
+Fallible construction and serialization report `BloomBuildError`, including
+invalid input, too many hashes, filters over the hard size limit, arithmetic
+overflow, and allocation failure. `from_bytes` reports `BloomDecodeError` for
+malformed headers or payloads, unsupported format metadata, oversized input,
+arithmetic overflow, and allocation failure. Both public error types implement
+`Display` and `std::error::Error`.
+
+`MAX_FILTER_BYTES` is a library-wide safety boundary for constructed,
+serialized, and decoded filters. It bounds memory use across those paths while
+still supporting filters for large key sets at common false-positive targets.
+Applications may enforce a smaller limit before passing bytes to this crate.
 
 ### Known-count construction and builder status
 
@@ -307,8 +392,6 @@ materially harms that compaction path.
 ### Inserting Keys
 
 ```rust
-let mut filter = BloomFilter::with_false_positive_rate(10_000, 0.01);
-
 let was_probably_present = filter.insert_key(b"alice");
 assert!(!was_probably_present);
 
@@ -353,7 +436,11 @@ let count = filter.count_may_contain_keys_prefetch(&key_refs);
 let branchless_count = filter.count_may_contain_keys_prefetch_branchless(&key_refs);
 ```
 
-The prefetch methods are useful for large batch workloads. They process keys in stack-allocated chunks of 32 lookup plans, optionally prefetching blocks before checking them.
+The batch methods process keys in stack-allocated chunks of 32 lookup plans.
+Prefetch and branchless lookup are optional mechanisms available in Bloom Bloom;
+they are not the default policy for RagnorDB. RagnorDB should enable either
+only after a repeatable end-to-end MultiGet/read-path benchmark demonstrates a
+benefit. Bloom-only lookup timings are not sufficient evidence.
 
 ```mermaid
 flowchart TD
@@ -370,19 +457,33 @@ Hardware prefetch is behind a feature flag:
 cargo run --release --features "demo-rayon prefetch"
 ```
 
-The standalone throughput demo uses Rayon and is excluded from default builds.
-Enable it with `demo-rayon`; hardware prefetch remains an independent choice.
+Rayon is used only by the standalone throughput demo and is excluded from
+default library builds. Opt in to the demo explicitly:
+
+```bash
+cargo run --release --features demo-rayon
+```
+
+Hardware prefetch remains an independent choice. Enable it with `prefetch` in
+addition to the demo feature:
+
+```bash
+cargo run --release --features "demo-rayon prefetch"
+```
+
 Without `prefetch`, the batch method still works and the hardware-prefetch call
 compiles to a no-op.
 
 ### Serialization
 
 ```rust
-let bytes = filter.to_bytes();
+let bytes = filter.try_to_bytes()?;
 let loaded = BloomFilter::from_bytes(&bytes)?;
 ```
 
-This is the API you would use to write the filter into an SSTable footer or metadata block.
+Use `try_to_bytes` on persistence paths so serialized-size checks and memory
+allocation failures are returned to the caller. `from_bytes` validates the
+serialized header and payload before fallibly allocating the decoded filter.
 
 ### Size And Probability Helpers
 
@@ -414,10 +515,35 @@ interpret application or database key formats, choose which logical identities
 to include, or decide when a filter is eligible for a lookup. The integration
 must apply the same key transformation before insertion and lookup.
 
+Bloom Bloom itself has no tombstone semantics. The caller chooses the byte-key
+domain inserted into the filter and must apply the same key transformation at
+construction and query time. Range-deletion semantics and the decision whether
+a query is eligible for whole-key Bloom pruning belong to the storage engine.
+A whole-key Bloom negative must not suppress a covering range tombstone.
+
 The calling application owns key normalization and deduplication, persisted
 metadata and integrity checks, cache policy, exact-lookup fallback, query
-eligibility, delete semantics, and metrics. These responsibilities remain
-outside this independently usable crate.
+eligibility, delete and range-deletion semantics, and metrics. These
+responsibilities remain outside this independently usable crate.
+
+The standalone public README is the Bloom Bloom documentation deliverable for
+Milestone 10.9. RagnorDB-level Bloom observability and end-to-end performance
+validation belong to Phase 10.12 and are not implemented in this crate.
+
+## Profiling-Gated Features
+
+Owned decoding is the reference implementation. Borrowed/zero-copy decoding is
+**DEFERRED — REQUIRES RAGNORDB ALLOCATION/CACHE PROFILING**; do not add it until
+measurements show that decode allocation or cache admission copying materially
+affects reopen/startup or point-read behavior.
+
+Prefetch and branchless batch lookup are **AVAILABLE IN BLOOM BLOOM** and **NOT
+ENABLED AS RAGNORDB DEFAULT**. They require a repeatable end-to-end RagnorDB
+MultiGet/read-path benefit before database integration enables them.
+
+Partitioned or prefix Bloom filters, Ribbon filters, Xor filters, Monkey-style
+level-aware allocation, alternate hash algorithms, and SIMD paths remain
+deferred unless a later RagnorDB storage benchmark establishes a need.
 
 ## Running The Project
 
@@ -464,8 +590,8 @@ The main performance choices are:
 - Bit positions inside a block are extracted with shifts and masks.
 - Multiply-high range reduction avoids `%` for block selection.
 - Batch lookup uses stack-allocated lookup plans instead of heap allocation.
-- Optional prefetch can help when filters are large enough to miss cache.
-- Branchless batch lookup can outperform short-circuit lookup for random missing-heavy workloads.
+- Optional prefetch and branchless batch lookup are mechanisms callers can
+  measure for their own workload. They do not select a database policy.
 
 Single-key lookup and batch throughput measure different things. Batch numbers can look extremely small per key because Rayon spreads work across many CPU threads. That is throughput, not isolated single-key latency.
 
@@ -504,6 +630,9 @@ key prep ns/key = elapsed nanoseconds / 10,000,000 prepared keys
 
 The lookup numbers are parallel throughput across 16 Rayon threads, not isolated single-lookup latency.
 
+This standalone demo snapshot is not RagnorDB end-to-end evidence and does not
+justify enabling prefetch or branchless lookup as a database default.
+
 ![alt text](new-benchmark.png)
 
 | Operation | Total Time | Nanoseconds Per Operation | Notes |
@@ -527,7 +656,7 @@ Bloom Bloom guarantees:
 - no false negatives for keys inserted into a completed filter state,
 - deterministic behavior for the same serialized format and hash seed,
 - checked decoding of serialized filters,
-- configurable false-positive targets based on expected item count.
+- configurable false-positive targets based on caller-provided expected item count.
 
 Bloom Bloom does not guarantee:
 
@@ -537,7 +666,10 @@ Bloom Bloom does not guarantee:
 - stable results if the hash seed or serialized format changes,
 - thread-safe mutation through shared references.
 
-For concurrent reads, share the completed filter immutably. For concurrent writes, use external synchronization or build separate filters and merge at a higher level.
+For concurrent reads, share the completed filter immutably. Construction and
+reset require exclusive mutable access; the crate does not provide shared or
+atomic mutation. Coordinate writes externally or construct independent filters
+whose combination is defined by the calling application.
 
 ## Repository Layout
 

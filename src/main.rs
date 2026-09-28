@@ -77,7 +77,7 @@ fn main() {
     let warmup_normal = present_key_refs
         .par_iter()
         .take(10_000.min(expected_items))
-        .filter(|key| loaded_filter.may_contain_key(*key))
+        .filter(|key| loaded_filter.may_contain_key(key))
         .count();
 
     let warmup_batch = loaded_filter
@@ -89,7 +89,7 @@ fn main() {
 
     let present_hits_normal = present_key_refs
         .par_iter()
-        .filter(|key| loaded_filter.may_contain_key(*key))
+        .filter(|key| loaded_filter.may_contain_key(key))
         .count();
 
     let present_normal_elapsed = start.elapsed();
@@ -98,7 +98,7 @@ fn main() {
 
     let false_positives_normal = missing_key_refs
         .par_iter()
-        .filter(|key| loaded_filter.may_contain_key(*key))
+        .filter(|key| loaded_filter.may_contain_key(key))
         .count();
 
     let missing_normal_elapsed = start.elapsed();
